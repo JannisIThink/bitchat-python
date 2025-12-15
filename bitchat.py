@@ -15,6 +15,7 @@ from enum import IntEnum
 from collections import defaultdict
 import logging
 import base64
+import multiprocessing
 
 from bleak import BleakClient, BleakScanner, BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
@@ -196,7 +197,9 @@ class FragmentCollector:
         return None
 
 class BitchatClient:
-    def __init__(self):
+    def __init__(self,fromLoRa = None,toLoRa = None):
+        self.fromLoRa = fromLoRa
+        self.toLoRa = toLoRa
         self.my_peer_id = os.urandom(8).hex()
         self.nickname = "my-python-client"
         self.peers: Dict[str, Peer] = {}
@@ -497,7 +500,7 @@ class BitchatClient:
                     if self.client:
                         self.handle_disconnect(self.client)
                     return
-                
+
                 # Handle blocking errors by retrying without response
                 if "could not complete without blocking" in str(e) or write_with_response:
                     try:
@@ -587,7 +590,7 @@ class BitchatClient:
                 else:
                     raise e
     
-    async def notification_handler(self, sender: BleakGATTCharacteristic, data: bytes):
+    async def notification_handler(self, sender: BleakGATTCharacteristic, data: bytes, noRelay: bool = False):
         """Handle incoming BLE notifications"""
         try:
             # Enhanced hex logging to match iOS format
@@ -605,7 +608,7 @@ class BitchatClient:
             if packet.sender_id_str == self.my_peer_id:
                 return
             
-            await self.handle_packet(packet, data)
+            await self.handle_packet(packet, data, noRelay)
             
         except Exception as e:
             try:
@@ -614,12 +617,12 @@ class BitchatClient:
                 # Silently ignore blocking errors
                 pass
     
-    async def handle_packet(self, packet: BitchatPacket, raw_data: bytes):
+    async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle incoming packet"""
         if packet.msg_type == MessageType.ANNOUNCE:
             await self.handle_announce(packet)
         elif packet.msg_type == MessageType.MESSAGE:
-            await self.handle_message(packet, raw_data)
+            await self.handle_message(packet, raw_data, noRelay)
         elif packet.msg_type in [MessageType.FRAGMENT_START, MessageType.FRAGMENT_CONTINUE, MessageType.FRAGMENT_END]:
             await self.handle_fragment(packet, raw_data)
         elif packet.msg_type == MessageType.KEY_EXCHANGE:
@@ -701,25 +704,28 @@ class BitchatClient:
                 except Exception as e:
                     debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
     
-    async def handle_message(self, packet: BitchatPacket, raw_data: bytes):
+    async def handle_message(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle chat message"""
         # Check if sender is blocked
         fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
         if fingerprint and fingerprint in self.blocked_peers:
             debug_println(f"[BLOCKED] Ignoring message from blocked peer: {packet.sender_id_str}")
             return
-        
+
         # Check if message is for us
         is_broadcast = packet.recipient_id == BROADCAST_RECIPIENT if packet.recipient_id else True
         is_for_us = is_broadcast or (packet.recipient_id_str == self.my_peer_id)
-        
+
         if not is_for_us:
             # Relay if TTL > 1
             if packet.ttl > 1:
                 await asyncio.sleep(random.uniform(0.01, 0.05))
                 relay_data = bytearray(raw_data)
-                relay_data[2] = packet.ttl - 1
+                relay_data[2] = packet.ttl #- 1
                 await self.send_packet(bytes(relay_data))
+                if (self.toLoRa != None) and (not noRelay):
+                    self.toLoRa : multiprocessing.Queue
+                    self.toLoRa.put(bytes(relay_data))
             return
         is_private_message = not is_broadcast and is_for_us
         decrypted_payload = None
@@ -742,23 +748,23 @@ class BitchatClient:
                 # Add to bloom filter and set
                 self.bloom.add(message.id)
                 self.processed_messages.add(message.id)
-                
+
                 # Display the message
                 await self.display_message(message, packet, is_private_message)
-                
+
                 # Send ACK if needed
                 if should_send_ack(is_private_message, message.channel, None, self.nickname, len(self.peers)):
                     await self.send_delivery_ack(message.id, packet.sender_id_str, is_private_message)
-                
+
                 # Relay if TTL > 1
                 if packet.ttl > 1:
                     await asyncio.sleep(random.uniform(0.01, 0.05))
                     relay_data = bytearray(raw_data)
-                    relay_data[2] = packet.ttl - 1
+                    relay_data[2] = packet.ttl #- 1
                     await self.send_packet(bytes(relay_data))
             else:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
-                    
+
         except Exception as e:
             debug_full_println(f"[ERROR] Failed to parse message: {e}")
     
@@ -841,7 +847,7 @@ class BitchatClient:
         if packet.ttl > 1:
             await asyncio.sleep(random.uniform(0.01, 0.05))
             relay_data = bytearray(raw_data)
-            relay_data[2] = packet.ttl - 1
+            relay_data[2] = packet.ttl #- 1
             await self.send_packet(bytes(relay_data))
     
     async def handle_key_exchange(self, packet: BitchatPacket):
@@ -1134,7 +1140,7 @@ class BitchatClient:
             self.chat_context.add_channel(channel)
             await self.save_app_state()
     
-    async def handle_delivery_ack(self, packet: BitchatPacket, raw_data: bytes):
+    async def handle_delivery_ack(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle delivery acknowledgment"""
         is_for_us = packet.recipient_id_str == self.my_peer_id if packet.recipient_id_str else False
         
@@ -1158,18 +1164,21 @@ class BitchatClient:
                     ack_data['timestamp'],
                     ack_data['hopCount']
                 )
-                
+
                 if self.delivery_tracker.mark_delivered(ack.original_message_id):
                     print(f"\r\u001b[K\u001b[90m✓ Delivered to {ack.recipient_nickname}\u001b[0m\n> ", end='', flush=True)
-                    
+
             except Exception as e:
                 debug_println(f"[ACK] Failed to parse delivery ACK: {e}")
-                
+
         elif packet.ttl > 1:
             # Relay ACK
             relay_data = bytearray(raw_data)
-            relay_data[2] = packet.ttl - 1
+            relay_data[2] = packet.ttl #- 1
             await self.send_packet(bytes(relay_data))
+            if (self.toLoRa != None) and (not noRelay):
+                self.toLoRa : multiprocessing.Queue
+                self.toLoRa.put(bytes(relay_data))
 
     async def handle_noise_identity_announce(self, packet: BitchatPacket):
         """Handle Noise identity announcement"""
@@ -2422,6 +2431,21 @@ class BitchatClient:
                 break
             except Exception as e:
                 debug_println(f"[ERROR] Input error: {e}")
+
+    async def fromLoraLoop(self):
+        while self.running:
+            try:
+                if self.fromLoRa != None:
+                    self.fromLoRa : multiprocessing.Queue
+                    package = self.fromLoRa.get()
+                    self.notification_handler(None,package,True)
+                else:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                self.running = False
+                break
+            except Exception as e:
+                debug_println(f"[ERROR] Queue error: {e}")
     
     async def run(self):
         """Main run loop"""
@@ -2449,7 +2473,7 @@ class BitchatClient:
         
         # Run input loop
         try:
-            await self.input_loop()
+            await self.fromLoraLoop()
         except KeyboardInterrupt:
             pass
         finally:
@@ -2834,9 +2858,9 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
             return True
     return False
 
-async def main():
+async def main(fromLoRa = None,toLoRa = None):
     """Main entry point"""
-    client = BitchatClient()
+    client = BitchatClient(fromLoRa,toLoRa)
     await client.run()
 
 if __name__ == "__main__":
