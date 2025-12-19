@@ -624,7 +624,7 @@ class BitchatClient:
         elif packet.msg_type == MessageType.MESSAGE:
             await self.handle_message(packet, raw_data, noRelay)
         elif packet.msg_type in [MessageType.FRAGMENT_START, MessageType.FRAGMENT_CONTINUE, MessageType.FRAGMENT_END]:
-            await self.handle_fragment(packet, raw_data)
+            await self.handle_fragment(packet, raw_data,noRelay)
         elif packet.msg_type == MessageType.KEY_EXCHANGE:
             await self.handle_key_exchange(packet)
         elif packet.msg_type == MessageType.NOISE_HANDSHAKE_INIT:
@@ -725,6 +725,7 @@ class BitchatClient:
                 await self.send_packet(bytes(relay_data))
                 if (self.toLoRa != None) and (not noRelay):
                     self.toLoRa : multiprocessing.Queue
+                    print(relay_data)
                     self.toLoRa.put(bytes(relay_data))
             return
         is_private_message = not is_broadcast and is_for_us
@@ -762,6 +763,10 @@ class BitchatClient:
                     relay_data = bytearray(raw_data)
                     relay_data[2] = packet.ttl #- 1
                     await self.send_packet(bytes(relay_data))
+                    if (self.toLoRa != None) and (not noRelay):
+                        self.toLoRa : multiprocessing.Queue
+                        print(relay_data)
+                        self.toLoRa.put(bytes(relay_data))
             else:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
 
@@ -825,7 +830,7 @@ class BitchatClient:
         
         print("> ", end='', flush=True)
     
-    async def handle_fragment(self, packet: BitchatPacket, raw_data: bytes):
+    async def handle_fragment(self, packet: BitchatPacket, raw_data: bytes,noRelay : bool = False):
         """Handle message fragment"""
         if len(packet.payload) >= 13:
             fragment_id = packet.payload[0:8]
@@ -849,6 +854,10 @@ class BitchatClient:
             relay_data = bytearray(raw_data)
             relay_data[2] = packet.ttl #- 1
             await self.send_packet(bytes(relay_data))
+            if (self.toLoRa != None) and (not noRelay):
+                    self.toLoRa : multiprocessing.Queue
+                    print(relay_data)
+                    self.toLoRa.put(bytes(relay_data))
     
     async def handle_key_exchange(self, packet: BitchatPacket):
         """Handle key exchange"""
@@ -1178,6 +1187,7 @@ class BitchatClient:
             await self.send_packet(bytes(relay_data))
             if (self.toLoRa != None) and (not noRelay):
                 self.toLoRa : multiprocessing.Queue
+                print(relay_data)
                 self.toLoRa.put(bytes(relay_data))
 
     async def handle_noise_identity_announce(self, packet: BitchatPacket):
