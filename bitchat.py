@@ -22,11 +22,11 @@ from bleak.backends.device import BLEDevice
 import aioconsole
 from pybloom_live import BloomFilter
 
-from encryption import EncryptionService, NoiseError
-from compression import compress_if_beneficial, decompress
-from fragmentation import Fragment, FragmentType, fragment_payload
-from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
-from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
+from .encryption import EncryptionService, NoiseError
+from .compression import compress_if_beneficial, decompress
+from .fragmentation import Fragment, FragmentType, fragment_payload
+from .terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
+from .persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 
 # Version
 VERSION = "v1.1.0"
