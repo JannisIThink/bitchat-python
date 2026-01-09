@@ -201,7 +201,7 @@ class BitchatClient:
         self.fromLoRa = fromLoRa
         self.toLoRa = toLoRa
         self.my_peer_id = os.urandom(8).hex()
-        self.nickname = "my-python-client"
+        self.nickname = "LoRa-Bridge"
         self.peers: Dict[str, Peer] = {}
         self.bloom = BloomFilter(capacity=500, error_rate=0.01)
         self.processed_messages: Set[str] = set()  # Backup for message IDs
