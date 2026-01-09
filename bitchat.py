@@ -725,7 +725,7 @@ class BitchatClient:
                 await self.send_packet(bytes(relay_data))
                 if (self.toLoRa != None) and (not noRelay):
                     self.toLoRa : multiprocessing.Queue
-                    print(relay_data)
+                    print("Sent:",parse_bitchat_packet(relay_data))
                     self.toLoRa.put(bytes(relay_data))
             return
         is_private_message = not is_broadcast and is_for_us
@@ -765,7 +765,7 @@ class BitchatClient:
                     await self.send_packet(bytes(relay_data))
                     if (self.toLoRa != None) and (not noRelay):
                         self.toLoRa : multiprocessing.Queue
-                        print(relay_data)
+                        print("Sent",parse_bitchat_packet(relay_data))
                         self.toLoRa.put(bytes(relay_data))
             else:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
@@ -856,7 +856,7 @@ class BitchatClient:
             await self.send_packet(bytes(relay_data))
             if (self.toLoRa != None) and (not noRelay):
                     self.toLoRa : multiprocessing.Queue
-                    print(relay_data)
+                    print("Sent",parse_bitchat_packet(relay_data))
                     self.toLoRa.put(bytes(relay_data))
     
     async def handle_key_exchange(self, packet: BitchatPacket):
@@ -1187,7 +1187,7 @@ class BitchatClient:
             await self.send_packet(bytes(relay_data))
             if (self.toLoRa != None) and (not noRelay):
                 self.toLoRa : multiprocessing.Queue
-                print(relay_data)
+                print("Sent",parse_bitchat_packet(relay_data))
                 self.toLoRa.put(bytes(relay_data))
 
     async def handle_noise_identity_announce(self, packet: BitchatPacket):
@@ -2448,9 +2448,10 @@ class BitchatClient:
                 if self.fromLoRa != None:
                     self.fromLoRa : multiprocessing.Queue
                     package = self.fromLoRa.get()
+                    print("Got:",parse_bitchat_packet(package))
                     self.notification_handler(None,package,True)
                 else:
-                    time.sleep(60)
+                    time.sleep(600)
             except KeyboardInterrupt:
                 self.running = False
                 break
