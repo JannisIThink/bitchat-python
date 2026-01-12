@@ -281,7 +281,8 @@ class BitchatClient:
         
         devices = await BleakScanner.discover(
             timeout=5.0,
-            service_uuids=[BITCHAT_SERVICE_UUID]
+            service_uuids=[BITCHAT_SERVICE_UUID],
+            scanning_mode="active"
         )
         
         for device in devices:
