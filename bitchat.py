@@ -22,7 +22,6 @@ from bleak.backends.device import BLEDevice
 import aioconsole
 from pybloom_live import BloomFilter
 
-import threading
 from .encryption import EncryptionService, NoiseError
 from .compression import compress_if_beneficial, decompress
 from .fragmentation import Fragment, FragmentType, fragment_payload
@@ -2874,51 +2873,47 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
             return True
     return False
 
-
 def advertise_ble(name: str, service_uuid: str):
-    """
-    Start BLE advertising with given name and service UUID.
-    Blocks and runs its own GLib MainLoop.
-    Suitable for running in a separate thread.
-    """
-
     bus = SystemBus()
     adapter = bus.get("org.bluez", "/org/bluez/hci0")
-    ad_manager = adapter.LEAdvertisingManager1
+    ad_manager = adapter["org.bluez.LEAdvertisingManager1"]
 
     ad_path = "/com/bitchat/advertisement0"
 
-    # Minimal Advertisement dictionary
-    advertisement_props = {
-        "Type": "peripheral",
-        "LocalName": name,
-        "ServiceUUIDs": [service_uuid]
-    }
+    # Minimal-Objekt
+    class Advertisement:
+        Type = "peripheral"
+        LocalName = name
+        ServiceUUIDs = [service_uuid]
+
+        def Release(self):
+            print("Advertisement released")
+
+    # Minimal D-Bus XML als String
+    xml = """
+    <node>
+    <interface name='org.bluez.LEAdvertisement1'>
+        <property name='Type' type='s' access='read'/>
+        <property name='LocalName' type='s' access='read'/>
+        <property name='ServiceUUIDs' type='as' access='read'/>
+        <method name='Release'/>
+    </interface>
+    </node>
+    """
+
+    # Registrierung beim Bus – nur String übergeben
+    bus.register_object(ad_path, Advertisement(), node_info=[xml])
 
     loop = GLib.MainLoop()
 
-    def on_register():
-        print(f"BLE Advertising started: {name} [{service_uuid}]")
-
-    def on_error(e):
+    try:
+        ad_manager.RegisterAdvertisement(ad_path, {})
+        print("Advertising started")
+    except Exception as e:
         print("BLE Advertising error:", e)
         loop.quit()
 
-    # Register advertisement
-    ad_manager.RegisterAdvertisement(ad_path, advertisement_props,
-                                     reply_handler=on_register,
-                                     error_handler=on_error)
-
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            ad_manager.UnregisterAdvertisement(ad_path)
-        except Exception:
-            pass
-        loop.quit()
+    loop.run()
 
 async def main(fromLoRa = None,toLoRa = None):
     """Main entry point"""
