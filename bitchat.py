@@ -22,11 +22,15 @@ from bleak.backends.device import BLEDevice
 import aioconsole
 from pybloom_live import BloomFilter
 
+import threading
 from .encryption import EncryptionService, NoiseError
 from .compression import compress_if_beneficial, decompress
 from .fragmentation import Fragment, FragmentType, fragment_payload
 from .terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from .persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
+
+from pydbus import SystemBus
+from gi.repository import GLib
 
 # Version
 VERSION = "v1.1.0"
@@ -2870,9 +2874,57 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
             return True
     return False
 
+
+def advertise_ble(name: str, service_uuid: str):
+    """
+    Start BLE advertising with given name and service UUID.
+    Blocks and runs its own GLib MainLoop.
+    Suitable for running in a separate thread.
+    """
+
+    bus = SystemBus()
+    adapter = bus.get("org.bluez", "/org/bluez/hci0")
+    ad_manager = adapter.LEAdvertisingManager1
+
+    ad_path = "/com/bitchat/advertisement0"
+
+    # Minimal Advertisement dictionary
+    advertisement_props = {
+        "Type": "peripheral",
+        "LocalName": name,
+        "ServiceUUIDs": [service_uuid]
+    }
+
+    loop = GLib.MainLoop()
+
+    def on_register():
+        print(f"BLE Advertising started: {name} [{service_uuid}]")
+
+    def on_error(e):
+        print("BLE Advertising error:", e)
+        loop.quit()
+
+    # Register advertisement
+    ad_manager.RegisterAdvertisement(ad_path, advertisement_props,
+                                     reply_handler=on_register,
+                                     error_handler=on_error)
+
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            ad_manager.UnregisterAdvertisement(ad_path)
+        except Exception:
+            pass
+        loop.quit()
+
 async def main(fromLoRa = None,toLoRa = None):
     """Main entry point"""
     client = BitchatClient(fromLoRa,toLoRa)
+    thr = threading.Thread(target=advertise_ble,args=["bitchat",BITCHAT_SERVICE_UUID],daemon=True)
+    thr.start()
     await client.run()
 
 if __name__ == "__main__":
