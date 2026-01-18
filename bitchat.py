@@ -2887,7 +2887,7 @@ def advertise_ble(name: str, service_uuid: str):
         LocalName = name
         ServiceUUIDs = [service_uuid]
         ManufacturerData = {
-            0xFFFF: bytes([0x01, 0x01])
+            0xFFFF: GLib.Variant('ay', [0x01, 0x91])
         }
 
 
