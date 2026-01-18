@@ -2886,6 +2886,10 @@ def advertise_ble(name: str, service_uuid: str):
         Type = "peripheral"
         LocalName = name
         ServiceUUIDs = [service_uuid]
+        ManufacturerData = {
+            0xFFFF: bytes([0x01, 0x01])
+        }
+
 
         def Release(self):
             print("Advertisement released")
@@ -2897,6 +2901,7 @@ def advertise_ble(name: str, service_uuid: str):
         <property name='Type' type='s' access='read'/>
         <property name='LocalName' type='s' access='read'/>
         <property name='ServiceUUIDs' type='as' access='read'/>
+        <property name='ManufacturerData' type='a{qv}' access='read'/>
         <method name='Release'/>
     </interface>
     </node>
