@@ -29,9 +29,6 @@ from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, forma
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 import threading
 
-from pydbus import SystemBus
-from gi.repository import GLib
-
 # Version
 VERSION = "v1.1.0"
 
@@ -2874,58 +2871,10 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
             return True
     return False
 
-def advertise_ble(name: str, service_uuid: str):
-    bus = SystemBus()
-    adapter = bus.get("org.bluez", "/org/bluez/hci0")
-    ad_manager = adapter["org.bluez.LEAdvertisingManager1"]
-
-    ad_path = "/com/bitchat/advertisement0"
-
-    # Minimal-Objekt
-    class Advertisement:
-        Type = "peripheral"
-        LocalName = name
-        ServiceUUIDs = [service_uuid]
-        ManufacturerData = {
-            0xFFFF: GLib.Variant('ay', [0x01, 0x91])
-        }
-
-
-        def Release(self):
-            print("Advertisement released")
-
-    # Minimal D-Bus XML als String
-    xml = """
-    <node>
-    <interface name='org.bluez.LEAdvertisement1'>
-        <property name='Type' type='s' access='read'/>
-        <property name='LocalName' type='s' access='read'/>
-        <property name='ServiceUUIDs' type='as' access='read'/>
-        <property name='ManufacturerData' type='a{qv}' access='read'/>
-        <method name='Release'/>
-    </interface>
-    </node>
-    """
-
-    # Registrierung beim Bus – nur String übergeben
-    bus.register_object(ad_path, Advertisement(), node_info=[xml])
-
-    loop = GLib.MainLoop()
-
-    try:
-        ad_manager.RegisterAdvertisement(ad_path, {})
-        print("Advertising started")
-    except Exception as e:
-        print("BLE Advertising error:", e)
-        loop.quit()
-
-    loop.run()
 
 async def main(fromLoRa = None,toLoRa = None):
     """Main entry point"""
     client = BitchatClient(fromLoRa,toLoRa)
-    thr = threading.Thread(target=advertise_ble,args=["bitchat",BITCHAT_SERVICE_UUID],daemon=True)
-    thr.start()
     await client.run()
 
 if __name__ == "__main__":
