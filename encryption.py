@@ -313,8 +313,8 @@ class NoiseHandshakeState:
                 if pattern == 'ee':
                     if not self.local_ephemeral_private or not self.remote_ephemeral_public:
                         raise NoiseError("Missing ephemeral keys for ee")
-                shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public, 'ee')
-                self._mix_key(shared)
+                    shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public, 'ee')
+                    self._mix_key(shared)
                 elif pattern == 'es':
                     if self.role == NoiseRole.INITIATOR:
                         if not self.local_ephemeral_private or not self.remote_static_public:
