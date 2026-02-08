@@ -82,14 +82,14 @@ class NoiseHandshakeState:
     
     def _mix_key(self, input_key_material: bytes):
         """Mix key material into chaining key and update cipher"""
-        print(f"[NOISE-MIX] _mix_key called with IKM (full 64 hex): {input_key_material.hex()}")
-        print(f"[NOISE-MIX] Current chaining_key (full 64 hex): {self.chaining_key.hex()}")
+        print(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
+        print(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
         
         # HKDF extract step: tempKey = HMAC(chainingKey, inputKeyMaterial)
         hmac = HMAC(self.chaining_key, hashes.SHA256())
         hmac.update(input_key_material)
         temp_key = hmac.finalize()
-        print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (full 64 hex): {temp_key.hex()}")
+        print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (first 32 hex): {temp_key.hex()[:32]}...")
         
         # HKDF expand step: generate 2 outputs (matching Swift)
         # output1 = HMAC(tempKey, "" + 0x01)
@@ -102,8 +102,8 @@ class NoiseHandshakeState:
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
         
-        print(f"[NOISE-MIX] output1 (new CK, full 64 hex): {output1.hex()}")
-        print(f"[NOISE-MIX] output2 (cipher key, full 64 hex): {output2.hex()}")
+        print(f"[NOISE-MIX] output1 (new CK, first 32 hex): {output1.hex()[:32]}...")
+        print(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
 
         self.chaining_key = output1
         # Primary key
@@ -112,8 +112,14 @@ class NoiseHandshakeState:
         # Build a small set of candidate alternative cipher keys to try when peers behave differently
         candidates = [output2]
 
+        # Candidate 1: Use temp_key directly (possibly peer doesn't do expand)
+        candidates.append(temp_key)
+        
+        # Candidate 2: Use chaining_key directly (edge case)
+        candidates.append(self.chaining_key)
+
+        # Candidate 3: HKDF variant
         try:
-            # HKDF variant: derive directly using cryptography HKDF (salt=ck, ikm=input_key_material)
             hk = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -125,8 +131,8 @@ class NoiseHandshakeState:
         except Exception:
             pass
 
+        # Candidate 4: HKDF with info
         try:
-            # HKDF with small info byte
             hk2 = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -138,12 +144,30 @@ class NoiseHandshakeState:
         except Exception:
             pass
 
+        # Candidate 5: Alternate HMAC ordering
         try:
-            # Alternate HMAC ordering: HMAC(temp_key, 0x02 + output1)
             hmac_alt = HMAC(temp_key, hashes.SHA256())
             hmac_alt.update(b'\x02' + output1)
             alt2 = hmac_alt.finalize()
             candidates.append(alt2)
+        except Exception:
+            pass
+
+        # Candidate 6: HMAC(temp_key, "") - without expand
+        try:
+            hmac_empty = HMAC(temp_key, hashes.SHA256())
+            hmac_empty.update(b'')
+            alt_empty = hmac_empty.finalize()
+            candidates.append(alt_empty)
+        except Exception:
+            pass
+
+        # Candidate 7: HMAC(IKM, CK) - reversed key/data
+        try:
+            hmac_rev = HMAC(input_key_material, hashes.SHA256())
+            hmac_rev.update(self.chaining_key)
+            alt_rev = hmac_rev.finalize()
+            candidates.append(alt_rev)
         except Exception:
             pass
 
@@ -157,13 +181,16 @@ class NoiseHandshakeState:
                 seen.add(h)
 
         self.candidate_cipher_keys = dedup
+        print(f"[NOISE-MIX] Generated {len(self.candidate_cipher_keys)} candidate cipher keys for fallback")
     
     def _mix_hash(self, data: bytes):
         """Mix data into handshake hash"""
         digest = hashes.Hash(hashes.SHA256())
         digest.update(self.hash_state)
         digest.update(data)
+        old_hash = self.hash_state
         self.hash_state = digest.finalize()
+        print(f"[NOISE-HASH] MixHash: old={old_hash.hex()[:16]}... input_len={len(data)}, new={self.hash_state.hex()[:16]}...")
     
     def _mix_key_and_hash(self, input_key_material: bytes):
         """Mix key material into both chaining key and hash"""
@@ -334,7 +361,6 @@ class NoiseHandshakeState:
             
             elif pattern == 's':
                 # Read static key (may be encrypted)
-                # Read static key (may be encrypted)
                 # With nonce extraction: 4 (nonce) + 32 (key) + 16 (tag) = 52 bytes encrypted
                 # Without extracted nonce (common variant): 32 (key) + 16 (tag) = 48 bytes
                 # Plain: 32 bytes
@@ -354,14 +380,18 @@ class NoiseHandshakeState:
                 
                 print(f"[NOISE-READ] Decrypting static s: len={len(static_data)}, cipher_has_key={self.cipher_state.has_key()}")
                 print(f"[NOISE-READ] Cipher key (first 16 bytes hex): {self.cipher_state.key[:16].hex() if self.cipher_state.key else 'None'}")
+                print(f"[NOISE-READ] Hash state BEFORE decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
+                print(f"[NOISE-READ] Static ciphertext (first 24 hex): {static_data[:24].hex()[:48]}...")
+                print(f"[NOISE-READ] Will use hash as AD: {self.hash_state.hex()[:32]}...")
                 
                 try:
                     decrypted = self._decrypt_and_hash(static_data)
                     self.remote_static_public = X25519PublicKey.from_public_bytes(decrypted)
                     print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
+                    print(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
                 except Exception as e:
                     # Primary decryption failed — try candidate keys (best-effort compatibility)
-                    print(f"[NOISE-READ] Primary static decryption failed: {e}. Trying alternative derived keys ({len(getattr(self, 'candidate_cipher_keys', []))})...")
+                    print(f"[NOISE-READ] Primary static decryption failed: {e}. Trying {len(getattr(self, 'candidate_cipher_keys', []))} alternative derived keys...")
                     alt_found = False
                     for idx, key in enumerate(getattr(self, 'candidate_cipher_keys', [])):
                         try:
@@ -535,53 +565,31 @@ class NoiseCipherState:
         
         # For short blocks (handshake): prioritize NO-PREFIX (Android doesn't extract nonce in handshake)
         if is_short_block and len(ciphertext_with_nonce) >= 16:
-            # HANDSHAKE PRIORITY 1: No prefix, nonce=0, with hash AD (matches _decrypt_and_hash semantics)
-            try:
-                nonce = b'\x00\x00\x00\x00' + (0).to_bytes(8, byteorder='little')
-                cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
-                self._mark_nonce_as_seen(0)
-                self._last_decryption_used_prefix = False
-                print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce=0, with hash AD")
-                return plaintext
-            except Exception as ex:
-                attempts.append(f"SHORT:no-prefix,n=0,AD: {type(ex).__name__}")
-            
-            # HANDSHAKE PRIORITY 2: No prefix, nonce=0, empty AD
-            try:
-                nonce = b'\x00\x00\x00\x00' + (0).to_bytes(8, byteorder='little')
-                cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, b'')
-                self._mark_nonce_as_seen(0)
-                self._last_decryption_used_prefix = False
-                print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce=0, empty AD")
-                return plaintext
-            except Exception as ex:
-                attempts.append(f"SHORT:no-prefix,n=0,empty: {type(ex).__name__}")
-            
-            # HANDSHAKE PRIORITY 3: No prefix, nonce=1, with hash AD
-            try:
-                nonce = b'\x00\x00\x00\x00' + (1).to_bytes(8, byteorder='little')
-                cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
-                self._mark_nonce_as_seen(1)
-                self._last_decryption_used_prefix = False
-                print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce=1, with hash AD")
-                return plaintext
-            except Exception as ex:
-                attempts.append(f"SHORT:no-prefix,n=1,AD: {type(ex).__name__}")
-            
-            # HANDSHAKE PRIORITY 4: No prefix, nonce=1, empty AD
-            try:
-                nonce = b'\x00\x00\x00\x00' + (1).to_bytes(8, byteorder='little')
-                cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, b'')
-                self._mark_nonce_as_seen(1)
-                self._last_decryption_used_prefix = False
-                print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce=1, empty AD")
-                return plaintext
-            except Exception as ex:
-                attempts.append(f"SHORT:no-prefix,n=1,empty: {type(ex).__name__}")
+            # HANDSHAKE PRIORITY 1-4: Try nonce 0 and 1 with hash AD and empty AD
+            for candidate_nonce in [0, 1]:
+                # With hash AD
+                try:
+                    nonce = b'\x00\x00\x00\x00' + candidate_nonce.to_bytes(8, byteorder='little')
+                    cipher = ChaCha20Poly1305(self.key)
+                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
+                    self._mark_nonce_as_seen(candidate_nonce)
+                    self._last_decryption_used_prefix = False
+                    print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce={candidate_nonce}, with hash AD")
+                    return plaintext
+                except Exception as ex:
+                    attempts.append(f"SHORT:no-prefix,n={candidate_nonce},AD: {type(ex).__name__}")
+                
+                # With empty AD
+                try:
+                    nonce = b'\x00\x00\x00\x00' + candidate_nonce.to_bytes(8, byteorder='little')
+                    cipher = ChaCha20Poly1305(self.key)
+                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, b'')
+                    self._mark_nonce_as_seen(candidate_nonce)
+                    self._last_decryption_used_prefix = False
+                    print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce={candidate_nonce}, empty AD")
+                    return plaintext
+                except Exception as ex:
+                    attempts.append(f"SHORT:no-prefix,n={candidate_nonce},empty: {type(ex).__name__}")
         
         # For all blocks (or if short-block no-prefix failed): try 4-byte prefix
         if len(ciphertext_with_nonce) >= 4 + 16:
