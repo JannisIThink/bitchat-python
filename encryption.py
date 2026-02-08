@@ -169,10 +169,22 @@ class NoiseHandshakeState:
             self._mix_hash(ciphertext_bytes)
             return ciphertext_bytes
     
-    def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
+    def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey, pattern: str = '?') -> bytes:
         """Perform Diffie-Hellman key exchange"""
+        # Log the inputs for debugging
+        private_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
         shared_key = private_key.exchange(public_key)
-        print(f"[NOISE-DH] shared key (full 64 hex): {shared_key.hex()}")
+        print(f"[NOISE-DH] Pattern '{pattern}': private key (full 64 hex): {private_bytes.hex()}")
+        print(f"[NOISE-DH] Pattern '{pattern}': public key (full 64 hex): {public_bytes.hex()}")
+        print(f"[NOISE-DH] Pattern '{pattern}': shared key (full 64 hex): {shared_key.hex()}")
         return shared_key
     
     def write_message(self, payload: bytes = b'') -> bytes:
@@ -212,7 +224,7 @@ class NoiseHandshakeState:
                 # DH(local ephemeral, remote ephemeral)
                 if not self.local_ephemeral_private or not self.remote_ephemeral_public:
                     raise NoiseError("Missing ephemeral keys for ee")
-                shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public)
+                shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public, 'ee')
                 self._mix_key(shared)
             
             elif pattern == 'es':
@@ -220,11 +232,11 @@ class NoiseHandshakeState:
                 if self.role == NoiseRole.INITIATOR:
                     if not self.local_ephemeral_private or not self.remote_static_public:
                         raise NoiseError("Missing keys for es")
-                    shared = self._dh(self.local_ephemeral_private, self.remote_static_public)
+                    shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'es')
                 else:
                     if not self.local_static_private or not self.remote_ephemeral_public:
                         raise NoiseError("Missing keys for es")
-                    shared = self._dh(self.local_static_private, self.remote_ephemeral_public)
+                    shared = self._dh(self.local_static_private, self.remote_ephemeral_public, 'es')
                 self._mix_key(shared)
             
             elif pattern == 'se':
@@ -232,11 +244,11 @@ class NoiseHandshakeState:
                 if self.role == NoiseRole.INITIATOR:
                     if not self.local_static_private or not self.remote_ephemeral_public:
                         raise NoiseError("Missing keys for se")
-                    shared = self._dh(self.local_static_private, self.remote_ephemeral_public)
+                    shared = self._dh(self.local_static_private, self.remote_ephemeral_public, 'se')
                 else:
                     if not self.local_ephemeral_private or not self.remote_static_public:
                         raise NoiseError("Missing keys for se")
-                    shared = self._dh(self.local_ephemeral_private, self.remote_static_public)
+                    shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                 self._mix_key(shared)
         
         # Encrypt payload
@@ -301,32 +313,27 @@ class NoiseHandshakeState:
                 if pattern == 'ee':
                     if not self.local_ephemeral_private or not self.remote_ephemeral_public:
                         raise NoiseError("Missing ephemeral keys for ee")
-                    shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public)
-                    print(f"[NOISE-READ] DH 'ee': {shared.hex()[:32]}...")
-                    self._mix_key(shared)
+                shared = self._dh(self.local_ephemeral_private, self.remote_ephemeral_public, 'ee')
+                self._mix_key(shared)
                 elif pattern == 'es':
                     if self.role == NoiseRole.INITIATOR:
                         if not self.local_ephemeral_private or not self.remote_static_public:
                             raise NoiseError("Missing keys for es")
-                        shared = self._dh(self.local_ephemeral_private, self.remote_static_public)
-                        print(f"[NOISE-READ] DH 'es' (init): {shared.hex()[:32]}...")
+                        shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'es')
                     else:
                         if not self.local_static_private or not self.remote_ephemeral_public:
                             raise NoiseError("Missing keys for es")
-                        shared = self._dh(self.local_static_private, self.remote_ephemeral_public)
-                        print(f"[NOISE-READ] DH 'es' (resp): {shared.hex()[:32]}...")
+                        shared = self._dh(self.local_static_private, self.remote_ephemeral_public, 'es')
                     self._mix_key(shared)
                 elif pattern == 'se':
                     if self.role == NoiseRole.INITIATOR:
                         if not self.local_static_private or not self.remote_ephemeral_public:
                             raise NoiseError("Missing keys for se")
-                        shared = self._dh(self.local_static_private, self.remote_ephemeral_public)
-                        print(f"[NOISE-READ] DH 'se' (init): {shared.hex()[:32]}...")
+                        shared = self._dh(self.local_static_private, self.remote_ephemeral_public, 'se')
                     else:
                         if not self.local_ephemeral_private or not self.remote_static_public:
                             raise NoiseError("Missing keys for se")
-                        shared = self._dh(self.local_ephemeral_private, self.remote_static_public)
-                        print(f"[NOISE-READ] DH 'se' (resp): {shared.hex()[:32]}...")
+                        shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                     self._mix_key(shared)
         
         # Decrypt payload
