@@ -456,7 +456,7 @@ class BitchatClient:
                 )
 
                 identity_packet = create_bitchat_packet_with_signature(
-                    self.my_peer_id, MessageType.NOISE_IDENTITY_ANNOUNCE, identity_payload, signature
+                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload, signature
                 )
                 await self.send_packet(identity_packet)
                 debug_println("[3] Sent Noise identity announcement (binary format)")
@@ -467,7 +467,7 @@ class BitchatClient:
                 # Fallback to old key exchange
                 handshake_message = self.encryption_service.initiate_handshake(self.my_peer_id)
                 handshake_packet = create_bitchat_packet(
-                    self.my_peer_id, MessageType.KEY_EXCHANGE, handshake_message
+                    self.my_peer_id, MessageType.NOISE_HANDSHAKE, handshake_message
                 )
                 await self.send_packet(handshake_packet)
 
@@ -591,11 +591,11 @@ class BitchatClient:
 
         for index, chunk in enumerate(chunks):
             if index == 0:
-                fragment_type = MessageType.FRAGMENT_START
+                fragment_type = MessageType.FRAGMENT
             elif index == len(chunks) - 1:
-                fragment_type = MessageType.FRAGMENT_END
+                fragment_type = MessageType.FRAGMENT
             else:
-                fragment_type = MessageType.FRAGMENT_CONTINUE
+                fragment_type = MessageType.FRAGMENT
 
             # Create fragment payload
             fragment_payload = bytearray()
@@ -665,22 +665,14 @@ class BitchatClient:
             await self.handle_announce(packet)
         elif packet.msg_type == MessageType.MESSAGE:
             await self.handle_message(packet, raw_data, noRelay)
-        elif packet.msg_type in [MessageType.FRAGMENT_START, MessageType.FRAGMENT_CONTINUE, MessageType.FRAGMENT_END]:
-            await self.handle_fragment(packet, raw_data,noRelay)
-        elif packet.msg_type == MessageType.KEY_EXCHANGE:
-            await self.handle_key_exchange(packet)
-        elif packet.msg_type == MessageType.NOISE_HANDSHAKE_INIT:
-            await self.handle_noise_handshake_init(packet)
-        elif packet.msg_type == MessageType.NOISE_HANDSHAKE_RESP:
-            await self.handle_noise_handshake_resp(packet)
+        elif packet.msg_type == MessageType.FRAGMENT:
+            await self.handle_fragment(packet, raw_data, noRelay)
+        elif packet.msg_type == MessageType.NOISE_HANDSHAKE:
+            await self.handle_noise_handshake(packet)
         elif packet.msg_type == MessageType.NOISE_ENCRYPTED:
             await self.handle_noise_encrypted(packet, raw_data)
         elif packet.msg_type == MessageType.LEAVE:
             await self.handle_leave(packet)
-        elif packet.msg_type == MessageType.CHANNEL_ANNOUNCE:
-            await self.handle_channel_announce(packet)
-        elif packet.msg_type == MessageType.NOISE_IDENTITY_ANNOUNCE:
-            await self.handle_noise_identity_announce(packet)
 
     async def handle_announce(self, packet: BitchatPacket):
         """Handle peer announcement"""
@@ -703,7 +695,7 @@ class BitchatClient:
                 try:
                     handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
                     handshake_packet = create_bitchat_packet_with_recipient(
-                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE_INIT, handshake_message, None
+                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
                     )
                     # Set TTL to 3 like iOS
                     handshake_data = bytearray(handshake_packet)
@@ -716,7 +708,7 @@ class BitchatClient:
                     # Fallback to old key exchange
                     key_exchange_payload = self.encryption_service.get_combined_public_key_data()
                     key_exchange_packet = create_bitchat_packet(
-                        self.my_peer_id, MessageType.KEY_EXCHANGE, key_exchange_payload
+                        self.my_peer_id, MessageType.NOISE_HANDSHAKE, key_exchange_payload
                     )
                     await self.send_packet(key_exchange_packet)
             else:
@@ -901,6 +893,57 @@ class BitchatClient:
                     print("Sent",parse_bitchat_packet(relay_data))
                     self.toLoRa.put(bytes(relay_data))
 
+    async def handle_noise_handshake(self, packet: BitchatPacket):
+        """Handle Noise handshake (combined handler for both init and response)"""
+        debug_println(f"[NOISE] Received handshake from {packet.sender_id_str}")
+        debug_println(f"[NOISE] Recipient ID: {packet.recipient_id_str}, My ID: {self.my_peer_id}")
+
+        # Check if this handshake is for us
+        if packet.recipient_id_str and packet.recipient_id_str != self.my_peer_id:
+            debug_println(f"[NOISE] Handshake not for us, ignoring")
+            return
+
+        # Check payload size 
+        payload_size = len(packet.payload)
+        debug_println(f"[NOISE] Handshake payload size: {payload_size} bytes")
+        debug_println(f"[NOISE] Handshake payload hex: {packet.payload.hex()[:64]}...")
+
+        try:
+            # Convert bytearray to bytes for encryption service
+            payload_bytes = bytes(packet.payload) if isinstance(packet.payload, bytearray) else packet.payload
+            response = self.encryption_service.process_handshake_message(packet.sender_id_str, payload_bytes)
+            debug_println(f"[NOISE] process_handshake_message returned: {bool(response)}, response size: {len(response) if response else 0}")
+
+            if response:
+                # Send handshake response with proper recipient
+                response_packet = create_bitchat_packet_with_recipient(
+                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None
+                )
+                # Set TTL to 3 like iOS
+                response_data = bytearray(response_packet)
+                response_data[2] = 3
+                await self.send_packet(bytes(response_data))
+                debug_println(f"[NOISE] Sent handshake response to {packet.sender_id_str}, payload size: {len(response)}")
+
+            if self.encryption_service.is_session_established(packet.sender_id_str):
+                debug_println(f"[NOISE] Handshake completed with {packet.sender_id_str}")
+                # Clear handshake attempt time on success (matching Swift)
+                self.handshake_attempt_times.pop(packet.sender_id_str, None)
+                peer_nickname = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str
+                print(f"\r\033[K\033[92m✓ Secure session established with {peer_nickname}\033[0m")
+                print("> ", end='', flush=True)
+                # Add small delay before sending pending messages to avoid BLE congestion
+                await asyncio.sleep(0.1)
+                # Send any pending private messages
+                await self.send_pending_private_messages(packet.sender_id_str)
+
+        except Exception as e:
+            debug_println(f"[NOISE] Handshake failed with {packet.sender_id_str}: {e}")
+            import traceback
+            debug_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
+            # Clear any partial handshake state
+            self.encryption_service.clear_handshake_state(packet.sender_id_str)
+
     async def handle_key_exchange(self, packet: BitchatPacket):
         """Handle key exchange"""
         try:
@@ -909,7 +952,7 @@ class BitchatClient:
             response = self.encryption_service.process_handshake_message(packet.sender_id_str, payload_bytes)
             if response:
                 response_packet = create_bitchat_packet(
-                    self.my_peer_id, MessageType.KEY_EXCHANGE, response
+                    self.my_peer_id, MessageType.NOISE_HANDSHAKE, response
                 )
                 await self.send_packet(response_packet)
 
@@ -920,7 +963,7 @@ class BitchatClient:
                     debug_println(f"[CRYPTO] Sending key exchange response to new peer {packet.sender_id_str}")
                     handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
                     key_exchange_packet = create_bitchat_packet(
-                        self.my_peer_id, MessageType.KEY_EXCHANGE, handshake_message
+                        self.my_peer_id, MessageType.NOISE_HANDSHAKE, handshake_message
                     )
                     await self.send_packet(key_exchange_packet)
 
@@ -951,7 +994,7 @@ class BitchatClient:
             if response:
                 # Send handshake response with proper recipient
                 response_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE_RESP, response, None
+                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None
                 )
                 # Set TTL to 3 like iOS
                 response_data = bytearray(response_packet)
@@ -1001,7 +1044,7 @@ class BitchatClient:
             if response:
                 # Send final handshake message
                 final_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE_INIT, response, None  # Continue with same type
+                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None  # Continue with same type
                 )
                 # Set TTL to 3 like iOS
                 final_data = bytearray(final_packet)
@@ -1295,7 +1338,7 @@ class BitchatClient:
                     try:
                         handshake_message = self.encryption_service.initiate_handshake(peer_id)
                         handshake_packet = create_bitchat_packet_with_recipient(
-                            self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE_INIT, handshake_message, None
+                            self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
                         )
                         # Set TTL to 3 like iOS
                         handshake_data = bytearray(handshake_packet)
@@ -1540,7 +1583,7 @@ class BitchatClient:
         payload = f"{channel}|{'1' if is_protected else '0'}|{self.my_peer_id}|{key_commitment or ''}"
         packet = create_bitchat_packet(
             self.my_peer_id,
-            MessageType.CHANNEL_ANNOUNCE,
+            MessageType.ANNOUNCE,
             payload.encode()
         )
 
@@ -2261,7 +2304,7 @@ class BitchatClient:
             try:
                 handshake_message = self.encryption_service.initiate_handshake(target_peer_id)
                 handshake_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id, target_peer_id, MessageType.NOISE_HANDSHAKE_INIT, handshake_message, None
+                    self.my_peer_id, target_peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
                 )
                 # Set TTL to 3 like iOS
                 handshake_data = bytearray(handshake_packet)
@@ -2452,7 +2495,7 @@ class BitchatClient:
                                 # Fallback
                                 key_exchange_payload = self.encryption_service.get_combined_public_key_data()
                                 key_exchange_packet = create_bitchat_packet(
-                                    self.my_peer_id, MessageType.KEY_EXCHANGE, key_exchange_payload
+                                    self.my_peer_id, MessageType.NOISE_HANDSHAKE, key_exchange_payload
                                 )
                                 await self.send_packet(key_exchange_packet)
 

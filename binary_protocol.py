@@ -82,6 +82,11 @@ class BitchatPacket:
     def sender_id_str(self) -> str:
         """Return sender_id as hex string"""
         return self.sender_id.hex()
+    
+    @property
+    def recipient_id_str(self) -> Optional[str]:
+        """Return recipient_id as hex string"""
+        return self.recipient_id.hex() if self.recipient_id else None
 
 
 class BinaryProtocol:
