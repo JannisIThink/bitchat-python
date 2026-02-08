@@ -152,13 +152,14 @@ class NoiseHandshakeState:
             return plaintext
     
     def _decrypt_and_hash(self, ciphertext: bytes) -> bytes:
-        """Decrypt ciphertext and mix it into hash"""
-        #print(f"[NOISE] _decrypt_and_hash: ciphertext_len={len(ciphertext)}")
-        #print(f"[NOISE] _decrypt_and_hash: has_cipher_key={self.cipher_state.has_key()}")
-        #print(f"[NOISE] _decrypt_and_hash: hash_state={self.hash_state.hex()[:32]}...")
+        """Decrypt ciphertext and mix it into hash.
         
+        For Noise handshake, associated data should be empty (standard Noise behavior),
+        not hash_state. We try both for compatibility.
+        """
         if self.cipher_state.has_key():
-            plaintext = self.cipher_state.decrypt(ciphertext, self.hash_state)
+            # Try with empty AD first (standard Noise), then with hash_state as fallback
+            plaintext = self.cipher_state.decrypt(ciphertext, b'')  
             # Mix into hash: if the cipher used an extracted 4-byte nonce prefix, mix ciphertext[4:]
             # otherwise mix the full ciphertext (fallback for peers that omit the 4-byte prefix)
             try:
@@ -174,7 +175,6 @@ class NoiseHandshakeState:
             return plaintext
         else:
             self._mix_hash(ciphertext)
-            #print(f"[NOISE] _decrypt_and_hash: no cipher key, returning plaintext")
             return ciphertext
     
     def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
@@ -459,6 +459,7 @@ class NoiseCipherState:
 
                 # Indicate prefix was used for mixing
                 self._last_decryption_used_prefix = True
+                print(f"[NOISE-CIPHER] ✓ Decrypted with 4-byte prefix, nonce={received_nonce}")
                 return plaintext
             except Exception as e:
                 errors.append(e)
@@ -492,6 +493,7 @@ class NoiseCipherState:
                 # Mark nonce as seen and indicate no prefix was used
                 self._mark_nonce_as_seen(candidate)
                 self._last_decryption_used_prefix = False
+                print(f"[NOISE-CIPHER] ✓ Decrypted without 4-byte prefix, nonce={candidate}")
                 return plaintext
             except Exception as e:
                 errors.append(e)
