@@ -666,7 +666,20 @@ class BitchatClient:
 
     async def handle_announce(self, packet: BitchatPacket):
         """Handle peer announcement"""
-        peer_nickname = packet.payload.decode('utf-8', errors='ignore').strip()
+        # Check if this is a Noise Identity Announcement (has signature) or simple text announce
+        if packet.signature:
+            # Parse as Noise Identity Announcement binary format
+            try:
+                result = self.parse_noise_identity_announcement_binary(packet.payload)
+                peer_nickname = result.get('nickname', 'Unknown')
+            except Exception as e:
+                debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
+                # Fallback to text
+                peer_nickname = packet.payload.decode('utf-8', errors='ignore').strip()
+        else:
+            # Simple text nickname
+            peer_nickname = packet.payload.decode('utf-8', errors='ignore').strip()
+        
         is_new_peer = packet.sender_id_str not in self.peers
 
         if packet.sender_id_str not in self.peers:
