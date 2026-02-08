@@ -930,7 +930,7 @@ class BitchatClient:
         # Check payload size 
         payload_size = len(packet.payload)
         debug_println(f"[NOISE] Handshake payload size: {payload_size} bytes")
-        debug_println(f"[NOISE] Handshake payload hex: {packet.payload.hex()[:64]}...")
+        debug_println(f"[NOISE] Handshake payload hex (full): {packet.payload.hex()}")
 
         try:
             # Convert bytearray to bytes for encryption service
@@ -958,13 +958,15 @@ class BitchatClient:
                 print("> ", end='', flush=True)
                 # Add small delay before sending pending messages to avoid BLE congestion
                 await asyncio.sleep(0.1)
-                # Send any pending private messages
-                await self.send_pending_private_messages(packet.sender_id_str)
 
         except Exception as e:
             debug_println(f"[NOISE] Handshake failed with {packet.sender_id_str}: {e}")
             import traceback
             debug_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
+            debug_println(f"[NOISE] Payload breakdown:")
+            debug_println(f"  - First 32 bytes (e): {packet.payload[:32].hex()}")
+            if len(packet.payload) > 32:
+                debug_println(f"  - Remaining bytes ({len(packet.payload)-32}): {packet.payload[32:].hex()}")
             # Clear any partial handshake state
             self.encryption_service.clear_handshake_state(packet.sender_id_str)
 
