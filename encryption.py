@@ -76,17 +76,20 @@ class NoiseHandshakeState:
         else:
             self.hash_state = hashlib.sha256(protocol_name).digest()
         self.chaining_key = self.hash_state
+        print(f"[NOISE-INIT] Protocol name: {NOISE_PROTOCOL_NAME}")
+        print(f"[NOISE-INIT] Initial hash_state (32 bytes): {self.hash_state.hex()}")
+        print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
     
     def _mix_key(self, input_key_material: bytes):
         """Mix key material into chaining key and update cipher"""
-        #print(f"[NOISE] _mix_key: input={input_key_material.hex()[:32]}...")
-        #print(f"[NOISE] _mix_key: chaining_key={self.chaining_key.hex()[:32]}...")
+        print(f"[NOISE-MIX] _mix_key called with IKM: {input_key_material.hex()[:32]}...")
+        print(f"[NOISE-MIX] Current chaining_key: {self.chaining_key.hex()[:32]}...")
         
         # HKDF extract step: tempKey = HMAC(chainingKey, inputKeyMaterial)
         hmac = HMAC(self.chaining_key, hashes.SHA256())
         hmac.update(input_key_material)
         temp_key = hmac.finalize()
-        #print(f"[NOISE] _mix_key: temp_key={temp_key.hex()[:32]}...")
+        print(f"[NOISE-MIX] temp_key HMAC(CK, IKM): {temp_key.hex()[:32]}...")
         
         # HKDF expand step: generate 2 outputs (matching Swift)
         # output1 = HMAC(tempKey, "" + 0x01)
@@ -99,8 +102,8 @@ class NoiseHandshakeState:
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
         
-        #print(f"[NOISE] _mix_key: new_chaining_key={output1.hex()[:32]}...")
-        #print(f"[NOISE] _mix_key: cipher_key={output2.hex()[:32]}...")
+        print(f"[NOISE-MIX] output1 (new CK): {output1.hex()[:32]}...")
+        print(f"[NOISE-MIX] output2 (cipher key): {output2.hex()[:32]}...")
         
         self.chaining_key = output1
         self.cipher_state.initialize_key(output2)
@@ -180,6 +183,7 @@ class NoiseHandshakeState:
     def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
         """Perform Diffie-Hellman key exchange"""
         shared_key = private_key.exchange(public_key)
+        print(f"[NOISE-DH] shared key result: {shared_key.hex()[:32]}...")
         return shared_key
     
     def write_message(self, payload: bytes = b'') -> bytes:
