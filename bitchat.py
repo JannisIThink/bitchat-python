@@ -104,21 +104,6 @@ class Peer:
     fingerprint: Optional[str] = None
 
 @dataclass
-class BitchatPacket:
-    """Wire format packet per BitChat Protocol spec"""
-    version: int  # 1 or 2
-    msg_type: MessageType
-    ttl: int
-    timestamp: int  # UInt64 milliseconds
-    flags: int  # Bitmask for optional fields
-    payload_length: int
-    sender_id: bytes  # 8 bytes
-    recipient_id: Optional[bytes] = None  # 8 bytes if HAS_RECIPIENT flag set
-    route: Optional[List[bytes]] = None  # List of 8-byte peer IDs (v2+ only)
-    payload: bytes = b''  # Message content (may be compressed)
-    signature: Optional[bytes] = None  # 64 bytes if HAS_SIGNATURE flag set
-    is_compressed: bool = False
-    original_size: Optional[int] = None  # Size before compression
 
 @dataclass
 class BitchatMessage:
