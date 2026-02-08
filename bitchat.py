@@ -666,19 +666,40 @@ class BitchatClient:
 
     async def handle_announce(self, packet: BitchatPacket):
         """Handle peer announcement"""
+        peer_nickname = None
+        
         # Check if this is a Noise Identity Announcement (has signature) or simple text announce
         if packet.signature:
             # Parse as Noise Identity Announcement binary format
             try:
                 result = self.parse_noise_identity_announcement_binary(packet.payload)
-                peer_nickname = result.get('nickname', 'Unknown')
+                if result and isinstance(result, dict):
+                    peer_nickname = result.get('nickname', None)
             except Exception as e:
                 debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
-                # Fallback to text
-                peer_nickname = packet.payload.decode('utf-8', errors='ignore').strip()
-        else:
-            # Simple text nickname
-            peer_nickname = packet.payload.decode('utf-8', errors='ignore').strip()
+                peer_nickname = None
+        
+        # Fallback to text decoding if we don't have a nickname yet
+        if not peer_nickname:
+            # Extract just the text part, skip binary  data
+            # Try to find readable ASCII text in the payload
+            text_parts = []
+            current_text = bytearray()
+            for byte in packet.payload:
+                if 32 <= byte <= 126:  # Printable ASCII
+                    current_text.append(byte)
+                else:
+                    if current_text:
+                        text_parts.append(current_text.decode('utf-8', errors='ignore').strip())
+                        current_text = bytearray()
+            if current_text:
+                text_parts.append(current_text.decode('utf-8', errors='ignore').strip())
+            
+            # Get the longest text part as nickname
+            if text_parts:
+                peer_nickname = max(text_parts, key=len)
+            else:
+                peer_nickname = packet.sender_id_str[:8]
         
         is_new_peer = packet.sender_id_str not in self.peers
 
