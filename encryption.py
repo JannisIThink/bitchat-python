@@ -143,9 +143,10 @@ class NoiseHandshakeState:
     def _encrypt_and_hash(self, plaintext: bytes) -> bytes:
         """Encrypt plaintext and mix ciphertext into hash"""
         if self.cipher_state.has_key():
-            ciphertext = self.cipher_state.encrypt(plaintext, self.hash_state)
-            self._mix_hash(ciphertext)
-            return ciphertext
+            output = self.cipher_state.encrypt(plaintext, self.hash_state)
+            # output = [4-byte nonce prefix][encrypted data], only mix encrypted part
+            self._mix_hash(output[4:])
+            return output
         else:
             self._mix_hash(plaintext)
             return plaintext
@@ -158,7 +159,8 @@ class NoiseHandshakeState:
         
         if self.cipher_state.has_key():
             plaintext = self.cipher_state.decrypt(ciphertext, self.hash_state)
-            self._mix_hash(ciphertext)
+            # ciphertext = [4-byte nonce prefix][encrypted data], only mix encrypted part
+            self._mix_hash(ciphertext[4:])
             #print(f"[NOISE] _decrypt_and_hash: decrypted {len(ciphertext)} -> {len(plaintext)} bytes")
             return plaintext
         else:
@@ -259,7 +261,9 @@ class NoiseHandshakeState:
             
             elif pattern == 's':
                 # Read static key (may be encrypted)
-                key_length = 48 if self.cipher_state.has_key() else 32  # 32 + 16 tag if encrypted
+                # With nonce extraction: 32 (key) + 4 (nonce) + 16 (tag) = 52 bytes encrypted
+                # Without encryption: 32 bytes
+                key_length = 52 if self.cipher_state.has_key() else 32
                 if len(buffer) < key_length:
                     raise NoiseError("Invalid message: insufficient data for static key")
                 static_data = buffer[:key_length]
@@ -348,61 +352,119 @@ class NoiseHandshakeState:
         return self.remote_static_public
 
 class NoiseCipherState:
-    """Cipher state for Noise Protocol transport encryption"""
+    """Cipher state for Noise Protocol transport encryption with nonce extraction.
+    
+    Per BitChat specification, the output format is:
+    [4-byte nonce prefix (big-endian)] [encrypted data] [16-byte Poly1305 MAC tag]
+    """
     
     def __init__(self):
         self.key = None
         self.nonce = 0
+        self.use_extracted_nonce = True  # BitChat always uses extracted nonce
+        self.highest_received_nonce = 0
+        self.replay_window_size = 1024
+        self.replay_window = [0] * 128  # 1024 bits = 128 bytes
     
     def initialize_key(self, key: bytes):
         """Initialize cipher with key"""
         self.key = key
         self.nonce = 0
+        self.highest_received_nonce = 0
+        self.replay_window = [0] * 128
     
     def has_key(self) -> bool:
         """Check if cipher has a key"""
         return self.key is not None
     
     def encrypt(self, plaintext: bytes, associated_data: bytes = b'') -> bytes:
-        """Encrypt plaintext with ChaCha20-Poly1305"""
+        """Encrypt plaintext with ChaCha20-Poly1305 and extract nonce.
+        
+        Returns: [4-byte nonce][encrypted data][16-byte MAC]
+        """
         if not self.has_key():
             raise NoiseError("Cipher not initialized")
         
-        # Create nonce from counter (12 bytes, matching Swift)
-        # Swift puts counter at positions 4-12, zeros at 0-4
+        # Use nonce as UInt32 (per spec: 4-byte nonce prefix)
+        nonce_u32 = self.nonce & 0xFFFFFFFF
+        
+        # Create 12-byte nonce for ChaCha20: [4 zero bytes][8 bytes of counter]
         nonce = b'\x00\x00\x00\x00' + self.nonce.to_bytes(8, byteorder='little')
         
         cipher = ChaCha20Poly1305(self.key)
         ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
         
+        # Extract nonce format: big-endian 4-byte prefix
+        nonce_prefix = nonce_u32.to_bytes(4, byteorder='big')
+        
+        # Output: nonce_prefix + ciphertext (which includes encrypted data + 16-byte tag)
+        result = nonce_prefix + ciphertext
+        
         self.nonce += 1
-        return ciphertext
+        return result
     
-    def decrypt(self, ciphertext: bytes, associated_data: bytes = b'') -> bytes:
-        """Decrypt ciphertext with ChaCha20-Poly1305"""
+    def decrypt(self, ciphertext_with_nonce: bytes, associated_data: bytes = b'') -> bytes:
+        """Decrypt ciphertext with extracted nonce.
+        
+        Input: [4-byte nonce][encrypted data][16-byte MAC]
+        """
         if not self.has_key():
             raise NoiseError("Cipher not initialized")
         
-        #print(f"[NOISE] NoiseCipher.decrypt: nonce={self.nonce}, ciphertext_len={len(ciphertext)}, ad_len={len(associated_data)}")
-        #print(f"[NOISE] NoiseCipher.decrypt: ad_hex={associated_data.hex()[:32]}...")
+        if len(ciphertext_with_nonce) < 4 + 16:  # Minimum: nonce + tag
+            raise NoiseError(f"Ciphertext too short: {len(ciphertext_with_nonce)}")
         
-        # Create nonce from counter (12 bytes, matching Swift)
-        # Swift puts counter at positions 4-12, zeros at 0-4
-        nonce = b'\x00\x00\x00\x00' + self.nonce.to_bytes(8, byteorder='little')
-        #print(f"[NOISE] NoiseCipher.decrypt: nonce_bytes={nonce.hex()}")
+        # Extract nonce from first 4 bytes (big-endian)
+        nonce_bytes = ciphertext_with_nonce[:4]
+        ciphertext = ciphertext_with_nonce[4:]
+        
+        received_nonce = int.from_bytes(nonce_bytes, byteorder='big')
+        
+        # Replay protection check
+        if not self._is_valid_nonce(received_nonce):
+            raise NoiseError(f"Replay detected or nonce too old: {received_nonce}")
+        
+        # Create 12-byte nonce for ChaCha20: [4 zero bytes][8 bytes of counter]
+        nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
         
         cipher = ChaCha20Poly1305(self.key)
         try:
             plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
-            self.nonce += 1
-            #print(f"[NOISE] NoiseCipher.decrypt: SUCCESS, plaintext_len={len(plaintext)}")
+            
+            # Mark nonce as seen after successful decryption
+            self._mark_nonce_as_seen(received_nonce)
+            
             return plaintext
         except Exception as e:
-            #print(f"[NOISE] NoiseCipher.decrypt: FAILED with {type(e).__name__}: {e}")
-            #print(f"[NOISE] NoiseCipher.decrypt: key={self.key.hex()[:32]}...")
-            # Increment nonce even on failure to maintain sync (Noise protocol requirement)
-            self.nonce += 1
-            raise
+            raise NoiseError(f"Decryption failed: {e}")
+    
+    def _is_valid_nonce(self, nonce: int) -> bool:
+        """Check if nonce is within acceptable window (replay protection)"""
+        if nonce > self.highest_received_nonce:
+            return True  # Newer nonce
+        
+        # Check if outside window
+        if self.highest_received_nonce >= self.replay_window_size:
+            if nonce <= self.highest_received_nonce - self.replay_window_size:
+                return False  # Too old
+        
+        # Check if already seen
+        window_index = nonce % self.replay_window_size
+        byte_index = window_index // 8
+        bit_index = window_index % 8
+        
+        return (self.replay_window[byte_index] & (1 << bit_index)) == 0
+    
+    def _mark_nonce_as_seen(self, nonce: int):
+        """Mark nonce as seen in replay window"""
+        if nonce > self.highest_received_nonce:
+            self.highest_received_nonce = nonce
+        
+        window_index = nonce % self.replay_window_size
+        byte_index = window_index // 8
+        bit_index = window_index % 8
+        
+        self.replay_window[byte_index] |= (1 << bit_index)
 
 @dataclass
 class NoiseSession:

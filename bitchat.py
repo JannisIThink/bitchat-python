@@ -27,6 +27,7 @@ from compression import compress_if_beneficial, decompress
 from fragmentation import Fragment, FragmentType, fragment_payload
 from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
+from binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
 import threading
 
 # Version
@@ -39,23 +40,18 @@ BITCHAT_CHARACTERISTIC_UUID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 # Cover traffic prefix used by iOS
 COVER_TRAFFIC_PREFIX = "☂DUMMY☂"
 
-# Packet header flags
+# Binary Protocol flags per specification
 FLAG_HAS_RECIPIENT = 0x01
 FLAG_HAS_SIGNATURE = 0x02
 FLAG_IS_COMPRESSED = 0x04
-
-# Message payload flags
-MSG_FLAG_IS_RELAY = 0x01
-MSG_FLAG_IS_PRIVATE = 0x02
-MSG_FLAG_HAS_ORIGINAL_SENDER = 0x04
-MSG_FLAG_HAS_RECIPIENT_NICKNAME = 0x08
-MSG_FLAG_HAS_SENDER_PEER_ID = 0x10
-MSG_FLAG_HAS_MENTIONS = 0x20
-MSG_FLAG_HAS_CHANNEL = 0x40
-MSG_FLAG_IS_ENCRYPTED = 0x80
+FLAG_HAS_ROUTE = 0x08
+FLAG_IS_RSR = 0x10
 
 SIGNATURE_SIZE = 64
 BROADCAST_RECIPIENT = b'\xFF' * 8
+
+# Protocol version
+PROTOCOL_VERSION = 2
 
 # Debug levels
 class DebugLevel(IntEnum):
@@ -81,52 +77,59 @@ def debug_full_println(*args, **kwargs):
             # Silently ignore blocking errors in debug output
             pass
 
-# Message types
+# Message types per BitChat specification (8 types only)
 class MessageType(IntEnum):
     ANNOUNCE = 0x01
-    KEY_EXCHANGE = 0x02
+    MESSAGE = 0x02
     LEAVE = 0x03
-    MESSAGE = 0x04
-    FRAGMENT_START = 0x05
-    FRAGMENT_CONTINUE = 0x06
-    FRAGMENT_END = 0x07
-    CHANNEL_ANNOUNCE = 0x08
-    CHANNEL_RETENTION = 0x09
-    DELIVERY_ACK = 0x0A
-    DELIVERY_STATUS_REQUEST = 0x0B
-    READ_RECEIPT = 0x0C
-    NOISE_HANDSHAKE_INIT = 0x10
-    NOISE_HANDSHAKE_RESP = 0x11
-    NOISE_ENCRYPTED = 0x12
-    NOISE_IDENTITY_ANNOUNCE = 0x13
-    CHANNEL_KEY_VERIFY_REQUEST = 0x14
-    CHANNEL_KEY_VERIFY_RESPONSE = 0x15
-    CHANNEL_PASSWORD_UPDATE = 0x16
-    CHANNEL_METADATA = 0x17
-    VERSION_HELLO = 0x20
-    VERSION_ACK = 0x21
+    NOISE_HANDSHAKE = 0x10
+    NOISE_ENCRYPTED = 0x11
+    FRAGMENT = 0x20
+    REQUEST_SYNC = 0x21
+    FILE_TRANSFER = 0x22
+
+# Noise Protocol payload types (for decrypted noiseEncrypted payloads)
+class NoisePayloadType(IntEnum):
+    PRIVATE_MESSAGE = 0x01
+    READ_RECEIPT = 0x02
+    DELIVERED = 0x03
+    VERIFY_CHALLENGE = 0x10
+    VERIFY_RESPONSE = 0x11
 
 @dataclass
 class Peer:
+    peer_id: str  # 16 hex chars from Noise public key fingerprint
     nickname: Optional[str] = None
+    public_key: Optional[bytes] = None
+    fingerprint: Optional[str] = None
 
 @dataclass
 class BitchatPacket:
+    """Wire format packet per BitChat Protocol spec"""
+    version: int  # 1 or 2
     msg_type: MessageType
-    sender_id: bytes
-    sender_id_str: str
-    recipient_id: Optional[bytes]
-    recipient_id_str: Optional[str]
-    payload: bytes
     ttl: int
+    timestamp: int  # UInt64 milliseconds
+    flags: int  # Bitmask for optional fields
+    payload_length: int
+    sender_id: bytes  # 8 bytes
+    recipient_id: Optional[bytes] = None  # 8 bytes if HAS_RECIPIENT flag set
+    route: Optional[List[bytes]] = None  # List of 8-byte peer IDs (v2+ only)
+    payload: bytes = b''  # Message content (may be compressed)
+    signature: Optional[bytes] = None  # 64 bytes if HAS_SIGNATURE flag set
+    is_compressed: bool = False
+    original_size: Optional[int] = None  # Size before compression
 
 @dataclass
 class BitchatMessage:
+    """Application-level message"""
     id: str
     content: str
-    channel: Optional[str]
-    is_encrypted: bool
-    encrypted_content: Optional[bytes]
+    sender: str  # peer nickname or ID
+    channel: Optional[str] = None
+    is_encrypted: bool = False
+    timestamp: int = 0
+    encrypted_content: Optional[bytes] = None
 
 @dataclass
 class DeliveryAck:
@@ -2551,90 +2554,9 @@ def unpad_packet(data: bytes) -> bytes:
     result = data[:-padding_length]
     return result
 
-def parse_bitchat_packet(data: bytes) -> BitchatPacket:
-    """Parse a BitChat packet from raw bytes"""
-    HEADER_SIZE = 13
-    SENDER_ID_SIZE = 8
-    RECIPIENT_ID_SIZE = 8
-
-    # Don't remove padding here - we need to parse the header first to know the actual packet size
-    # The iOS client expects properly structured packets with padding intact during parsing
-
-    if len(data) < HEADER_SIZE + SENDER_ID_SIZE:
-        raise ValueError("Packet too small")
-
-    offset = 0
-
-    # Version
-    version = data[offset]
-    offset += 1
-    if version != 1:
-        raise ValueError("Unsupported version")
-
-    # Type
-    msg_type = MessageType(data[offset])
-    offset += 1
-
-    # TTL
-    ttl = data[offset]
-    offset += 1
-
-    # Timestamp (skip)
-    offset += 8
-
-    # Flags
-    flags = data[offset]
-    offset += 1
-    has_recipient = (flags & FLAG_HAS_RECIPIENT) != 0
-    has_signature = (flags & FLAG_HAS_SIGNATURE) != 0
-    is_compressed = (flags & FLAG_IS_COMPRESSED) != 0
-
-    # Payload length
-    payload_len = struct.unpack('>H', data[offset:offset+2])[0]
-    offset += 2
-
-    # Sender ID (trim null bytes)
-    sender_id_raw = data[offset:offset+SENDER_ID_SIZE]
-    # Remove trailing null bytes
-    sender_id = sender_id_raw.rstrip(b'\x00')
-    sender_id_str = sender_id.hex()
-    offset += SENDER_ID_SIZE
-
-    # Recipient ID
-    recipient_id = None
-    recipient_id_str = None
-    if has_recipient:
-        recipient_id_raw = data[offset:offset+RECIPIENT_ID_SIZE]
-        # Remove trailing null bytes
-        recipient_id = recipient_id_raw.rstrip(b'\x00')
-        recipient_id_str = recipient_id.hex()
-        offset += RECIPIENT_ID_SIZE
-
-    # Payload
-    payload_end = offset + payload_len
-    payload = data[offset:payload_end]
-    offset = payload_end
-
-    # Signature
-    signature = None
-    if has_signature:
-        if len(data) >= offset + SIGNATURE_SIZE:
-            signature = data[offset:offset+SIGNATURE_SIZE]
-        else:
-            debug_println(f"[WARN] Packet has signature flag but not enough data for signature.")
-
-    # Decompress if needed
-    if is_compressed:
-        payload = decompress(payload)
-
-    # Ensure payload is bytes
-    if isinstance(payload, bytearray):
-        payload = bytes(payload)
-
-    return BitchatPacket(
-        msg_type, sender_id, sender_id_str,
-        recipient_id, recipient_id_str, payload, ttl
-    )
+def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
+    """Parse a BitChat packet from raw bytes (compatibility wrapper)"""
+    return BinaryProtocol.decode(data)
 
 def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
     """Parse message payload, matching Swift implementation"""
@@ -2702,93 +2624,76 @@ def create_bitchat_packet_with_recipient(sender_id: str, recipient_id: Optional[
     """Create a BitChat packet with all options"""
     debug_full_println(f"[RAW SEND] Creating packet: type={msg_type.name}, payload_len={len(payload)}")
 
-    # Create the packet first
-    packet = bytearray()
+    # Convert sender_id string to bytes if needed
+    if isinstance(sender_id, str):
+        try:
+            sender_bytes = bytes.fromhex(sender_id)
+            if len(sender_bytes) > 8:
+                sender_bytes = sender_bytes[:8]
+            elif len(sender_bytes) < 8:
+                sender_bytes = sender_bytes + b'\x00' * (8 - len(sender_bytes))
+        except ValueError:
+            sender_bytes = sender_id.encode('utf-8')[:8].ljust(8, b'\x00')
+    else:
+        sender_bytes = sender_id
 
-    # Version
-    packet.append(1)
-
-    # Type
-    packet.append(msg_type.value)
-
-    # TTL
-    packet.append(7)
-
-    # Timestamp
-    timestamp_ms = int(time.time() * 1000)
-    packet.extend(struct.pack('>Q', timestamp_ms))
-
-    # Flags
-    flags = 0
-    # Include recipient field if:
-    # 1. A specific recipient is provided (targeted message), OR  
-    # 2. This is a message type that uses broadcast recipient (not fragments)
-    exclude_recipient_types = [MessageType.FRAGMENT_START, MessageType.FRAGMENT_CONTINUE, MessageType.FRAGMENT_END]
-    if recipient_id is not None or msg_type not in exclude_recipient_types:
-        flags |= FLAG_HAS_RECIPIENT
-    if signature:
-        flags |= FLAG_HAS_SIGNATURE
-    packet.append(flags)
-
-    # Payload length
-    packet.extend(struct.pack('>H', len(payload)))
-
-    # Sender ID (exactly 8 bytes, padded with zeros if needed)
-    sender_bytes = bytes.fromhex(sender_id)
-    packet.extend(sender_bytes[:8])  # Take first 8 bytes
-    if len(sender_bytes) < 8:
-        packet.extend(bytes(8 - len(sender_bytes)))  # Pad with zeros
-
-    # Recipient ID (exactly 8 bytes if present)
-    if flags & FLAG_HAS_RECIPIENT:
-        if recipient_id:
-            recipient_bytes = bytes.fromhex(recipient_id)
-            packet.extend(recipient_bytes[:8])  # Take first 8 bytes
-            if len(recipient_bytes) < 8:
-                packet.extend(bytes(8 - len(recipient_bytes)))  # Pad with zeros
+    # Convert recipient_id if needed
+    recipient_bytes = None
+    if recipient_id:
+        if isinstance(recipient_id, str):
+            try:
+                recipient_bytes = bytes.fromhex(recipient_id)
+                if len(recipient_bytes) > 8:
+                    recipient_bytes = recipient_bytes[:8]
+                elif len(recipient_bytes) < 8:
+                    recipient_bytes = recipient_bytes + b'\x00' * (8 - len(recipient_bytes))
+            except ValueError:
+                recipient_bytes = recipient_id.encode('utf-8')[:8].ljust(8, b'\x00')
         else:
-            packet.extend(BROADCAST_RECIPIENT)
+            recipient_bytes = recipient_id
 
-    # Payload
-    packet.extend(payload)
+    # Create packet
+    packet = BitchatPacket(
+        version=PROTOCOL_VERSION,
+        msg_type=msg_type,
+        ttl=7,
+        timestamp=int(time.time() * 1000),
+        sender_id=sender_bytes,
+        payload=payload,
+        recipient_id=recipient_bytes,
+        signature=signature
+    )
 
-    # Signature
-    if signature:
-        packet.extend(signature)
-
-    # Apply iOS-style padding to standard block sizes for traffic analysis resistance
-    # iOS pads ALL packets to 256 bytes for consistent BLE transmission
+    # Encode packet
+    encoded = BinaryProtocol.encode(packet)
+    
+    # Add iOS-style padding to standard block sizes for traffic analysis resistance
     block_sizes = [256, 512, 1024, 2048]
-    # Account for encryption overhead (~16 bytes for AES-GCM tag)
-    total_size = len(packet) + 16
-
+    total_size = len(encoded)
+    
     # Find smallest block that fits
     target_size = None
     for block_size in block_sizes:
         if total_size <= block_size:
             target_size = block_size
             break
-
+    
     if target_size is None:
-        # For very large messages, just use the original size (will be fragmented anyway)
-        target_size = len(packet)
-
-    padding_needed = target_size - len(packet)
-
-    # PKCS#7 only supports padding up to 255 bytes
-    # If we need more padding than that, don't pad - return original data
+        target_size = total_size
+    
+    padding_needed = target_size - len(encoded)
+    
+    # PKCS#7 padding
     if 0 < padding_needed <= 255:
-        # iOS-style PKCS#7 padding: random bytes + padding length as last byte
         padding = bytearray(os.urandom(padding_needed - 1))
         padding.append(padding_needed)
-        packet.extend(padding)
-
+        encoded = encoded + bytes(padding)
+    
     # Add hex logging to match iOS format
-    final_packet = bytes(packet)
-    hex_string = ' '.join(f'{b:02X}' for b in final_packet)
+    hex_string = ' '.join(f'{b:02X}' for b in encoded)
     debug_full_println(f"[RAW SEND] {hex_string}")
-
-    return final_packet
+    
+    return encoded
 
 def create_bitchat_message_payload_full(sender: str, content: str, channel: Optional[str],
                                       is_private: bool, sender_peer_id: str, is_encrypted: bool, encrypted_content: Optional[bytes]) -> Tuple[bytes, str]:
