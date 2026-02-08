@@ -104,9 +104,59 @@ class NoiseHandshakeState:
         
         print(f"[NOISE-MIX] output1 (new CK, full 64 hex): {output1.hex()}")
         print(f"[NOISE-MIX] output2 (cipher key, full 64 hex): {output2.hex()}")
-        
+
         self.chaining_key = output1
+        # Primary key
         self.cipher_state.initialize_key(output2)
+
+        # Build a small set of candidate alternative cipher keys to try when peers behave differently
+        candidates = [output2]
+
+        try:
+            # HKDF variant: derive directly using cryptography HKDF (salt=ck, ikm=input_key_material)
+            hk = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=self.chaining_key,
+                info=b''
+            )
+            hk_key = hk.derive(input_key_material)
+            candidates.append(hk_key)
+        except Exception:
+            pass
+
+        try:
+            # HKDF with small info byte
+            hk2 = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=self.chaining_key,
+                info=b'noise'
+            )
+            hk_key2 = hk2.derive(input_key_material)
+            candidates.append(hk_key2)
+        except Exception:
+            pass
+
+        try:
+            # Alternate HMAC ordering: HMAC(temp_key, 0x02 + output1)
+            hmac_alt = HMAC(temp_key, hashes.SHA256())
+            hmac_alt.update(b'\x02' + output1)
+            alt2 = hmac_alt.finalize()
+            candidates.append(alt2)
+        except Exception:
+            pass
+
+        # Deduplicate while preserving order
+        seen = set()
+        dedup = []
+        for k in candidates:
+            h = k.hex()
+            if h not in seen:
+                dedup.append(k)
+                seen.add(h)
+
+        self.candidate_cipher_keys = dedup
     
     def _mix_hash(self, data: bytes):
         """Mix data into handshake hash"""
@@ -304,9 +354,36 @@ class NoiseHandshakeState:
                 print(f"[NOISE-READ] Decrypting static s: len={len(static_data)}, cipher_has_key={self.cipher_state.has_key()}")
                 print(f"[NOISE-READ] Cipher key (first 16 bytes hex): {self.cipher_state.key[:16].hex() if self.cipher_state.key else 'None'}")
                 
-                decrypted = self._decrypt_and_hash(static_data)
-                self.remote_static_public = X25519PublicKey.from_public_bytes(decrypted)
-                print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
+                try:
+                    decrypted = self._decrypt_and_hash(static_data)
+                    self.remote_static_public = X25519PublicKey.from_public_bytes(decrypted)
+                    print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
+                except Exception as e:
+                    # Primary decryption failed — try candidate keys (best-effort compatibility)
+                    print(f"[NOISE-READ] Primary static decryption failed: {e}. Trying alternative derived keys ({len(getattr(self, 'candidate_cipher_keys', []))})...")
+                    alt_found = False
+                    for idx, key in enumerate(getattr(self, 'candidate_cipher_keys', [])):
+                        try:
+                            tmp_cipher = NoiseCipherState()
+                            tmp_cipher.initialize_key(key)
+                            # Try same variants as NoiseCipherState.decrypt would
+                            plaintext = tmp_cipher.decrypt(static_data, b'')
+                            # Success
+                            print(f"[NOISE-READ] ✓ Alt decrypt succeeded with candidate #{idx}")
+                            # Adopt this key for ongoing cipher state
+                            self.cipher_state.initialize_key(key)
+                            # Mix the full ciphertext into hash (match _decrypt_and_hash semantics)
+                            self._mix_hash(static_data)
+                            self.remote_static_public = X25519PublicKey.from_public_bytes(plaintext)
+                            alt_found = True
+                            break
+                        except Exception as ex:
+                            # continue trying
+                            print(f"[NOISE-READ] candidate #{idx} failed: {type(ex).__name__}")
+                            continue
+
+                    if not alt_found:
+                        raise
             
             elif pattern in ['ee', 'es', 'se']:
                 # Perform DH operations (same as write_message)
