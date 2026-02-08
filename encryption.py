@@ -84,33 +84,40 @@ class NoiseHandshakeState:
         """Mix key material into chaining key and update cipher"""
         print(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
         print(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
-        
+
         # HKDF extract step: tempKey = HMAC(chainingKey, inputKeyMaterial)
         hmac = HMAC(self.chaining_key, hashes.SHA256())
         hmac.update(input_key_material)
         temp_key = hmac.finalize()
         print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (first 32 hex): {temp_key.hex()[:32]}...")
-        
-        # HKDF expand step: generate 2 outputs (matching Swift)
-        # output1 = HMAC(tempKey, "" + 0x01)
+
+        # HKDF expand step: generate 3 outputs per Noise spec
+        # output1 = HMAC(tempKey, 0x01)
         # output2 = HMAC(tempKey, output1 + 0x02)
+        # output3 = HMAC(tempKey, output2 + 0x03)
         hmac1 = HMAC(temp_key, hashes.SHA256())
         hmac1.update(b'\x01')
         output1 = hmac1.finalize()
-        
+
         hmac2 = HMAC(temp_key, hashes.SHA256())
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
-        
+
+        hmac3 = HMAC(temp_key, hashes.SHA256())
+        hmac3.update(output2 + b'\x03')
+        output3 = hmac3.finalize()
+
         print(f"[NOISE-MIX] output1 (new CK, first 32 hex): {output1.hex()[:32]}...")
-        print(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
+        print(f"[NOISE-MIX] output2 (to hash, first 32 hex): {output2.hex()[:32]}...")
+        print(f"[NOISE-MIX] output3 (cipher key, first 32 hex): {output3.hex()[:32]}...")
 
         self.chaining_key = output1
-        # Primary key
-        self.cipher_state.initialize_key(output2)
+        # Per Noise spec, mix output2 into the hash and use output3 as the cipher key
+        self._mix_hash(output2)
+        self.cipher_state.initialize_key(output3)
 
         # Build a small set of candidate alternative cipher keys to try when peers behave differently
-        candidates = [output2]
+        candidates = [output3]
 
         # Candidate 1: Use temp_key directly (possibly peer doesn't do expand)
         candidates.append(temp_key)
@@ -224,8 +231,9 @@ class NoiseHandshakeState:
         """Encrypt plaintext and mix ciphertext into hash"""
         if self.cipher_state.has_key():
             output = self.cipher_state.encrypt(plaintext, self.hash_state)
-            # output = [4-byte nonce prefix][encrypted data], only mix encrypted part
-            self._mix_hash(output[4:])
+            # output = [4-byte nonce prefix][encrypted data]; mix the FULL ciphertext
+            # bytes so both sides hash the same data (includes nonce prefix).
+            self._mix_hash(output)
             return output
         else:
             self._mix_hash(plaintext)
