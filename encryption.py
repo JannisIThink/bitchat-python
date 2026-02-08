@@ -82,14 +82,14 @@ class NoiseHandshakeState:
     
     def _mix_key(self, input_key_material: bytes):
         """Mix key material into chaining key and update cipher"""
-        print(f"[NOISE-MIX] _mix_key called with IKM: {input_key_material.hex()[:32]}...")
-        print(f"[NOISE-MIX] Current chaining_key: {self.chaining_key.hex()[:32]}...")
+        print(f"[NOISE-MIX] _mix_key called with IKM (full 64 hex): {input_key_material.hex()}")
+        print(f"[NOISE-MIX] Current chaining_key (full 64 hex): {self.chaining_key.hex()}")
         
         # HKDF extract step: tempKey = HMAC(chainingKey, inputKeyMaterial)
         hmac = HMAC(self.chaining_key, hashes.SHA256())
         hmac.update(input_key_material)
         temp_key = hmac.finalize()
-        print(f"[NOISE-MIX] temp_key HMAC(CK, IKM): {temp_key.hex()[:32]}...")
+        print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (full 64 hex): {temp_key.hex()}")
         
         # HKDF expand step: generate 2 outputs (matching Swift)
         # output1 = HMAC(tempKey, "" + 0x01)
@@ -102,8 +102,8 @@ class NoiseHandshakeState:
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
         
-        print(f"[NOISE-MIX] output1 (new CK): {output1.hex()[:32]}...")
-        print(f"[NOISE-MIX] output2 (cipher key): {output2.hex()[:32]}...")
+        print(f"[NOISE-MIX] output1 (new CK, full 64 hex): {output1.hex()}")
+        print(f"[NOISE-MIX] output2 (cipher key, full 64 hex): {output2.hex()}")
         
         self.chaining_key = output1
         self.cipher_state.initialize_key(output2)
@@ -183,7 +183,7 @@ class NoiseHandshakeState:
     def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
         """Perform Diffie-Hellman key exchange"""
         shared_key = private_key.exchange(public_key)
-        print(f"[NOISE-DH] shared key result: {shared_key.hex()[:32]}...")
+        print(f"[NOISE-DH] shared key (full 64 hex): {shared_key.hex()}")
         return shared_key
     
     def write_message(self, payload: bytes = b'') -> bytes:
@@ -205,6 +205,7 @@ class NoiseHandshakeState:
                 )
                 message_buffer.extend(ephemeral_bytes)
                 self._mix_hash(ephemeral_bytes)
+                print(f"[NOISE-WRITE] Generated local ephemeral e (full 64 hex): {ephemeral_bytes.hex()}")
             
             elif pattern == 's':
                 # Send static key (encrypted if cipher is initialized)
@@ -212,7 +213,10 @@ class NoiseHandshakeState:
                     encoding=serialization.Encoding.Raw,
                     format=serialization.PublicFormat.Raw
                 )
+                print(f"[NOISE-WRITE] Encrypting local static key (full 64 hex): {static_bytes.hex()}")
+                print(f"[NOISE-WRITE] Cipher has key: {self.cipher_state.has_key()}")
                 encrypted = self._encrypt_and_hash(static_bytes)
+                print(f"[NOISE-WRITE] Encrypted static (len={len(encrypted)}): {encrypted[:50].hex()}...")
                 message_buffer.extend(encrypted)
             
             elif pattern == 'ee':
@@ -274,6 +278,7 @@ class NoiseHandshakeState:
                 self.remote_ephemeral_public = X25519PublicKey.from_public_bytes(ephemeral_data)
                 self._mix_hash(ephemeral_data)
                 print(f"[NOISE-READ] ✓ Read ephemeral e: {ephemeral_data.hex()[:32]}...")
+                print(f"[NOISE-READ] Remote ephemeral (full 64 hex): {ephemeral_data.hex()}")
             
             elif pattern == 's':
                 # Read static key (may be encrypted)
