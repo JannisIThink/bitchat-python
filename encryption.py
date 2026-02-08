@@ -154,31 +154,20 @@ class NoiseHandshakeState:
             self._mix_hash(plaintext)
             return plaintext
     
-    def _decrypt_and_hash(self, ciphertext: bytes) -> bytes:
+    def _decrypt_and_hash(self, ciphertext_bytes: bytes) -> bytes:
         """Decrypt ciphertext and mix it into hash.
         
-        For Noise handshake, associated data should be empty (standard Noise behavior),
-        not hash_state. We try both for compatibility.
+        CRITICAL: Hash the FULL ciphertext bytes as received (with nonce prefix if present),
+        NOT a substring. This must match the peer's implementation.
         """
         if self.cipher_state.has_key():
-            # Try with empty AD first (standard Noise), then with hash_state as fallback
-            plaintext = self.cipher_state.decrypt(ciphertext, b'')  
-            # Mix into hash: if the cipher used an extracted 4-byte nonce prefix, mix ciphertext[4:]
-            # otherwise mix the full ciphertext (fallback for peers that omit the 4-byte prefix)
-            try:
-                used_prefix = getattr(self.cipher_state, '_last_decryption_used_prefix', True)
-            except Exception:
-                used_prefix = True
-
-            if used_prefix:
-                self._mix_hash(ciphertext[4:])
-            else:
-                self._mix_hash(ciphertext)
-
+            plaintext = self.cipher_state.decrypt(ciphertext_bytes, b'')
+            # IMPORTANT: Mix the FULL ciphertext_bytes into the hash, regardless of prefix
+            self._mix_hash(ciphertext_bytes)
             return plaintext
         else:
-            self._mix_hash(ciphertext)
-            return ciphertext
+            self._mix_hash(ciphertext_bytes)
+            return ciphertext_bytes
     
     def _dh(self, private_key: X25519PrivateKey, public_key: X25519PublicKey) -> bytes:
         """Perform Diffie-Hellman key exchange"""
