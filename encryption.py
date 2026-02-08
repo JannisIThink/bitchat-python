@@ -159,9 +159,18 @@ class NoiseHandshakeState:
         
         if self.cipher_state.has_key():
             plaintext = self.cipher_state.decrypt(ciphertext, self.hash_state)
-            # ciphertext = [4-byte nonce prefix][encrypted data], only mix encrypted part
-            self._mix_hash(ciphertext[4:])
-            #print(f"[NOISE] _decrypt_and_hash: decrypted {len(ciphertext)} -> {len(plaintext)} bytes")
+            # Mix into hash: if the cipher used an extracted 4-byte nonce prefix, mix ciphertext[4:]
+            # otherwise mix the full ciphertext (fallback for peers that omit the 4-byte prefix)
+            try:
+                used_prefix = getattr(self.cipher_state, '_last_decryption_used_prefix', True)
+            except Exception:
+                used_prefix = True
+
+            if used_prefix:
+                self._mix_hash(ciphertext[4:])
+            else:
+                self._mix_hash(ciphertext)
+
             return plaintext
         else:
             self._mix_hash(ciphertext)
@@ -261,11 +270,21 @@ class NoiseHandshakeState:
             
             elif pattern == 's':
                 # Read static key (may be encrypted)
-                # With nonce extraction: 32 (key) + 4 (nonce) + 16 (tag) = 52 bytes encrypted
-                # Without encryption: 32 bytes
-                key_length = 52 if self.cipher_state.has_key() else 32
-                if len(buffer) < key_length:
-                    raise NoiseError("Invalid message: insufficient data for static key")
+                # Read static key (may be encrypted)
+                # With nonce extraction: 4 (nonce) + 32 (key) + 16 (tag) = 52 bytes encrypted
+                # Without extracted nonce (common variant): 32 (key) + 16 (tag) = 48 bytes
+                # Plain: 32 bytes
+                if self.cipher_state.has_key():
+                    if len(buffer) >= 52:
+                        key_length = 52
+                    elif len(buffer) >= 48:
+                        # Peer likely omitted 4-byte nonce prefix; accept 48-byte encrypted static
+                        key_length = 48
+                    else:
+                        raise NoiseError("Invalid message: insufficient data for static key")
+                else:
+                    key_length = 32
+
                 static_data = buffer[:key_length]
                 buffer = buffer[key_length:]
                 
@@ -410,33 +429,61 @@ class NoiseCipherState:
         """
         if not self.has_key():
             raise NoiseError("Cipher not initialized")
-        
-        if len(ciphertext_with_nonce) < 4 + 16:  # Minimum: nonce + tag
-            raise NoiseError(f"Ciphertext too short: {len(ciphertext_with_nonce)}")
-        
-        # Extract nonce from first 4 bytes (big-endian)
-        nonce_bytes = ciphertext_with_nonce[:4]
-        ciphertext = ciphertext_with_nonce[4:]
-        
-        received_nonce = int.from_bytes(nonce_bytes, byteorder='big')
-        
-        # Replay protection check
-        if not self._is_valid_nonce(received_nonce):
-            raise NoiseError(f"Replay detected or nonce too old: {received_nonce}")
-        
-        # Create 12-byte nonce for ChaCha20: [4 zero bytes][8 bytes of counter]
-        nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
-        
-        cipher = ChaCha20Poly1305(self.key)
-        try:
-            plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
-            
-            # Mark nonce as seen after successful decryption
-            self._mark_nonce_as_seen(received_nonce)
-            
-            return plaintext
-        except Exception as e:
-            raise NoiseError(f"Decryption failed: {e}")
+        # If input looks like it contains a 4-byte nonce prefix, try that first
+        errors = []
+        if len(ciphertext_with_nonce) >= 4 + 16:
+            try:
+                nonce_bytes = ciphertext_with_nonce[:4]
+                ciphertext = ciphertext_with_nonce[4:]
+                received_nonce = int.from_bytes(nonce_bytes, byteorder='big')
+
+                # Replay protection check
+                if not self._is_valid_nonce(received_nonce):
+                    raise NoiseError(f"Replay detected or nonce too old: {received_nonce}")
+
+                # Create 12-byte nonce for ChaCha20: [4 zero bytes][8 bytes of counter]
+                nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
+
+                cipher = ChaCha20Poly1305(self.key)
+                plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
+
+                # Mark nonce as seen after successful decryption
+                self._mark_nonce_as_seen(received_nonce)
+
+                # Indicate prefix was used for mixing
+                self._last_decryption_used_prefix = True
+                return plaintext
+            except Exception as e:
+                errors.append(e)
+
+        # Fallback: some peers may omit the 4-byte nonce prefix and send raw ciphertext+tag (e.g., 48 bytes)
+        # Try plausible nonce candidates (0, highest_received_nonce+1, highest_received_nonce)
+        candidates = []
+        candidates.append(0)
+        candidates.append(self.highest_received_nonce + 1)
+        candidates.append(self.highest_received_nonce)
+        # Deduplicate while preserving order
+        seen = set()
+        candidates = [c for c in candidates if c not in seen and not seen.add(c)]
+
+        for candidate in candidates:
+            # Skip invalid/replayed nonces
+            if not self._is_valid_nonce(candidate):
+                continue
+            try:
+                nonce = b'\x00\x00\x00\x00' + candidate.to_bytes(8, byteorder='little')
+                cipher = ChaCha20Poly1305(self.key)
+                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
+
+                # Mark nonce as seen and indicate no prefix was used
+                self._mark_nonce_as_seen(candidate)
+                self._last_decryption_used_prefix = False
+                return plaintext
+            except Exception as e:
+                errors.append(e)
+
+        # If we reach here, decryption failed for all attempts
+        raise NoiseError(f"Decryption failed (tried with/without nonce prefix): {errors}")
     
     def _is_valid_nonce(self, nonce: int) -> bool:
         """Check if nonce is within acceptable window (replay protection)"""
