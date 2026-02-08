@@ -77,6 +77,11 @@ class BitchatPacket:
     route: Optional[List[bytes]] = None
     signature: Optional[bytes] = None
     original_size: Optional[int] = None
+    
+    @property
+    def sender_id_str(self) -> str:
+        """Return sender_id as hex string"""
+        return self.sender_id.hex()
 
 
 class BinaryProtocol:
