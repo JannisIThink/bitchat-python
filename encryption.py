@@ -445,7 +445,14 @@ class NoiseCipherState:
                 nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
 
                 cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
+                try:
+                    plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
+                except Exception as e_ad:
+                    # Try with empty associated data as a fallback for non-conformant peers
+                    try:
+                        plaintext = cipher.decrypt(nonce, ciphertext, b'')
+                    except Exception:
+                        raise e_ad
 
                 # Mark nonce as seen after successful decryption
                 self._mark_nonce_as_seen(received_nonce)
@@ -473,7 +480,14 @@ class NoiseCipherState:
             try:
                 nonce = b'\x00\x00\x00\x00' + candidate.to_bytes(8, byteorder='little')
                 cipher = ChaCha20Poly1305(self.key)
-                plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
+                try:
+                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
+                except Exception as e_ad:
+                    # Fallback: try empty associated data (some peers omit associated data)
+                    try:
+                        plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, b'')
+                    except Exception:
+                        raise e_ad
 
                 # Mark nonce as seen and indicate no prefix was used
                 self._mark_nonce_as_seen(candidate)
@@ -483,7 +497,15 @@ class NoiseCipherState:
                 errors.append(e)
 
         # If we reach here, decryption failed for all attempts
-        raise NoiseError(f"Decryption failed (tried with/without nonce prefix): {errors}")
+        # Include some context for easier debugging
+        error_msgs = []
+        for e in errors:
+            try:
+                error_msgs.append(str(e))
+            except Exception:
+                error_msgs.append(repr(e))
+
+        raise NoiseError(f"Decryption failed (tried with/without nonce prefix and AD variants): {error_msgs}")
     
     def _is_valid_nonce(self, nonce: int) -> bool:
         """Check if nonce is within acceptable window (replay protection)"""

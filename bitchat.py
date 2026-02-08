@@ -635,6 +635,10 @@ class BitchatClient:
         try:
             packet = parse_bitchat_packet(data)
 
+            if packet is None:
+                debug_full_println(f"[ERROR] Failed to parse packet: decode returned None")
+                return
+
             # Ignore our own messages (they are already displayed when sent)
             if packet.sender_id_str == self.my_peer_id:
                 return
