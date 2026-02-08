@@ -211,7 +211,8 @@ class NoiseHandshakeState:
         NOT a substring. This must match the peer's implementation.
         """
         if self.cipher_state.has_key():
-            plaintext = self.cipher_state.decrypt(ciphertext_bytes, b'')
+            # Use the current handshake hash as associated data (matches _encrypt_and_hash)
+            plaintext = self.cipher_state.decrypt(ciphertext_bytes, self.hash_state)
             # IMPORTANT: Mix the FULL ciphertext_bytes into the hash, regardless of prefix
             self._mix_hash(ciphertext_bytes)
             return plaintext
@@ -367,7 +368,7 @@ class NoiseHandshakeState:
                             tmp_cipher = NoiseCipherState()
                             tmp_cipher.initialize_key(key)
                             # Try same variants as NoiseCipherState.decrypt would
-                            plaintext = tmp_cipher.decrypt(static_data, b'')
+                            plaintext = tmp_cipher.decrypt(static_data, self.hash_state)
                             # Success
                             print(f"[NOISE-READ] ✓ Alt decrypt succeeded with candidate #{idx}")
                             # Adopt this key for ongoing cipher state
