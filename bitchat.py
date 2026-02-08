@@ -283,15 +283,52 @@ class BitchatClient:
         """Scan for BitChat service"""
         debug_println("[1] Scanning for bitchat service...")
 
-        devices = await BleakScanner.discover(
-            timeout=5.0,
-            service_uuids=[BITCHAT_SERVICE_UUID],
-        )
+        # First attempt: filtered discover by service UUID (fast on platforms that expose UUIDs in advertisement)
+        try:
+            devices = await BleakScanner.discover(timeout=5.0, service_uuids=[BITCHAT_SERVICE_UUID])
+        except Exception:
+            devices = []
 
         for device in devices:
-            debug_full_println(f"Found device: {device.name} - {device.address}")
+            debug_full_println(f"Found device (filtered): {device.name} - {device.address}")
             return device
 
+        # Second attempt: scan all devices and inspect advertisement metadata and name
+        debug_full_println("No devices found with UUID filter, scanning all advertisements...")
+        try:
+            all_devices = await BleakScanner.discover(timeout=5.0)
+        except Exception:
+            all_devices = []
+
+        def _normalize_uuid(u: str) -> str:
+            return u.replace('-', '').lower()
+
+        target_norm = _normalize_uuid(BITCHAT_SERVICE_UUID)
+
+        for device in all_devices:
+            debug_full_println(f"Advert: name={device.name} address={device.address} metadata={getattr(device, 'metadata', {})}")
+
+            # 1) Match by friendly name
+            try:
+                if device.name and 'bitchat' in device.name.lower():
+                    debug_full_println(f"Matched by name: {device.name}")
+                    return device
+            except Exception:
+                pass
+
+            # 2) Match by advertised UUIDs in metadata (normalize forms)
+            md = getattr(device, 'metadata', {}) or {}
+            uuids = md.get('uuids') or md.get('uuids', [])
+            if uuids:
+                for u in uuids:
+                    try:
+                        if _normalize_uuid(u) == target_norm:
+                            debug_full_println(f"Matched by advertised UUID on {device.address}")
+                            return device
+                    except Exception:
+                        continue
+
+        # Nothing found
         return None
 
     def handle_disconnect(self, client: BleakClient):
