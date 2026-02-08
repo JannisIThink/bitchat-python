@@ -103,13 +103,12 @@ class NoisePayloadType(IntEnum):
     VERIFY_RESPONSE = 0x11
 
 @dataclass
+@dataclass
 class Peer:
-    peer_id: str  # 16 hex chars from Noise public key fingerprint
+    peer_id: str = ""  # 16 hex chars from Noise public key fingerprint
     nickname: Optional[str] = None
     public_key: Optional[bytes] = None
     fingerprint: Optional[str] = None
-
-@dataclass
 
 @dataclass
 class BitchatMessage:
