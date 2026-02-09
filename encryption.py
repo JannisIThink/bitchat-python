@@ -83,7 +83,7 @@ class NoiseHandshakeState:
         print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
     
     def _mix_key(self, input_key_material: bytes):
-        """Mix key material into chaining key and update cipher"""
+        """Mix key material into chaining key and update cipher - uses 2-output HKDF per Noise spec"""
         print(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
         print(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
 
@@ -93,10 +93,10 @@ class NoiseHandshakeState:
         temp_key = hmac.finalize()
         print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (first 32 hex): {temp_key.hex()[:32]}...")
 
-        # HKDF expand step: generate 3 outputs per Noise spec
+        # HKDF expand step: generate 2 outputs per OFFICIAL Noise spec
+        # This is the standard method used by iOS, Android, and other implementations
         # output1 = HMAC(tempKey, 0x01)
         # output2 = HMAC(tempKey, output1 + 0x02)
-        # output3 = HMAC(tempKey, output2 + 0x03)
         hmac1 = HMAC(temp_key, hashes.SHA256())
         hmac1.update(b'\x01')
         output1 = hmac1.finalize()
@@ -105,38 +105,42 @@ class NoiseHandshakeState:
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
 
-        hmac3 = HMAC(temp_key, hashes.SHA256())
-        hmac3.update(output2 + b'\x03')
-        output3 = hmac3.finalize()
-
         print(f"[NOISE-MIX] output1 (new CK, first 32 hex): {output1.hex()[:32]}...")
-        print(f"[NOISE-MIX] output2 (to hash, first 32 hex): {output2.hex()[:32]}...")
-        print(f"[NOISE-MIX] output3 (cipher key, first 32 hex): {output3.hex()[:32]}...")
+        print(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
 
+        # Per OFFICIAL Noise spec: output1 becomes chaining key, output2 becomes cipher key
+        # We mix output2 into the hash AFTER setting the cipher key
         self.chaining_key = output1
         
-        # CRITICAL: Save hash state BEFORE mixing output2 (for fallback compatibility)
-        # if peer doesn't mix output2 into hash
+        # Save hash state BEFORE mixing (for fallback if peer doesn't mix output2)
         self.hash_state_before_mix = self.hash_state
         
-        # Per Noise spec, mix output2 into the hash and use output3 as the cipher key
+        self.cipher_state.initialize_key(output2)
         self._mix_hash(output2)
-        self.cipher_state.initialize_key(output3)
 
-        # Build a small set of candidate alternative cipher keys to try when peers behave differently
-        candidates = [output3]
+        # Build candidate alternative cipher keys for robustness
+        # This handles edge cases where peers might implement it slightly differently
+        candidates = [output2]
         
-        # Candidate 1: output2 directly (if peer uses 2-output HKDF or older variant)
-        candidates.append(output2)
+        # Also generate 3-output variants for full fallback compatibility
+        try:
+            hmac3 = HMAC(temp_key, hashes.SHA256())
+            hmac3.update(output2 + b'\x03')
+            output3_alt = hmac3.finalize()
+            candidates.append(output3_alt)
+            print(f"[NOISE-MIX] Also trying 3-output variant as candidate: {output3_alt.hex()[:32]}...")
+        except Exception:
+            pass
 
-        # Candidate 2: Use temp_key directly (possibly peer doesn't do expand)
+        # Candidate: Use temp_key directly (edge case)
         candidates.append(temp_key)
         
-        # Candidate 3: Use chaining_key directly (edge case)
+        # Candidate: Use chaining_key directly
         candidates.append(self.chaining_key)
 
-        # Candidate 3: HKDF variant
+        # Try HKDF-SHA256 library function
         try:
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
             hk = HKDF(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -148,25 +152,12 @@ class NoiseHandshakeState:
         except Exception:
             pass
 
-        # Candidate 4: HKDF with info
-        try:
-            hk2 = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=self.chaining_key,
-                info=b'noise'
-            )
-            hk_key2 = hk2.derive(input_key_material)
-            candidates.append(hk_key2)
-        except Exception:
-            pass
-
-        # Candidate 5: Alternate HMAC ordering
+        # Candidate: Alternate nonce/output order
         try:
             hmac_alt = HMAC(temp_key, hashes.SHA256())
             hmac_alt.update(b'\x02' + output1)
-            alt2 = hmac_alt.finalize()
-            candidates.append(alt2)
+            alt_key = hmac_alt.finalize()
+            candidates.append(alt_key)
         except Exception:
             pass
 

@@ -1609,15 +1609,27 @@ class BitchatClient:
             sig_key_len = data[offset]
             offset += 1
             
-            # Sanity: signing key should be 32 bytes
+            debug_println(f"[NOISE] Android format: sig_key_len={sig_key_len}, data remaining={len(data)-offset} bytes")
+            
+            # Sanity: signing key should be 32 bytes, but accept shorter if that's all we have
             if sig_key_len != 32:
+                # Accept other common sizes (24, 16) or be lenient with truncated data
+                debug_println(f"[NOISE] Warning: Expected sig_key_len=32 but got {sig_key_len}")
+                if sig_key_len == 0:
+                    return None  # 0-length key is still invalid
+            
+            # Accept truncated key (if not enough data, use what we have)
+            available_for_sig = len(data) - offset
+            actual_sig_len = min(sig_key_len, available_for_sig)
+            
+            if actual_sig_len < 16:  # At least some key material expected
+                debug_println(f"[NOISE] Error: signing key too short ({actual_sig_len} bytes)")
                 return None
             
-            if offset + sig_key_len > len(data):
-                return None
+            signing_key = data[offset:offset+actual_sig_len]
+            offset += actual_sig_len
             
-            signing_key = data[offset:offset+sig_key_len]
-            offset += sig_key_len
+            debug_println(f"[NOISE] Accepted signing key of {actual_sig_len} bytes (expected {sig_key_len})")
             
             # Try to read timestamp (8 bytes, big-endian)
             timestamp_ms = 0
@@ -1637,7 +1649,7 @@ class BitchatClient:
                 'timestamp': timestamp_ms / 1000.0,
                 'signature': '',
                 'previousPeerID': None,
-                'truncated': False
+                'truncated': actual_sig_len < sig_key_len  # Mark if truncated
             }
         except:
             return None
