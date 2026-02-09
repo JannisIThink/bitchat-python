@@ -51,6 +51,7 @@ class NoiseHandshakeState:
         # Symmetric state
         self.chaining_key = None
         self.hash_state = None
+        self.hash_state_before_mix = None  # Store pre-MixKey hash for fallback AD
         self.cipher_state = NoiseCipherState()
         
         # Pattern tracking
@@ -76,6 +77,7 @@ class NoiseHandshakeState:
         else:
             self.hash_state = hashlib.sha256(protocol_name).digest()
         self.chaining_key = self.hash_state
+        self.hash_state_before_mix = self.hash_state  # Initially same
         print(f"[NOISE-INIT] Protocol name: {NOISE_PROTOCOL_NAME}")
         print(f"[NOISE-INIT] Initial hash_state (32 bytes): {self.hash_state.hex()}")
         print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
@@ -112,6 +114,11 @@ class NoiseHandshakeState:
         print(f"[NOISE-MIX] output3 (cipher key, first 32 hex): {output3.hex()[:32]}...")
 
         self.chaining_key = output1
+        
+        # CRITICAL: Save hash state BEFORE mixing output2 (for fallback compatibility)
+        # if peer doesn't mix output2 into hash
+        self.hash_state_before_mix = self.hash_state
+        
         # Per Noise spec, mix output2 into the hash and use output3 as the cipher key
         self._mix_hash(output2)
         self.cipher_state.initialize_key(output3)
@@ -401,28 +408,51 @@ class NoiseHandshakeState:
                     print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
                     print(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
                 except Exception as e:
-                    # Primary decryption failed — try candidate keys (best-effort compatibility)
-                    print(f"[NOISE-READ] Primary static decryption failed: {e}. Trying {len(getattr(self, 'candidate_cipher_keys', []))} alternative derived keys...")
+                    # Primary decryption failed — try with hash_state_before_mix (if peer doesn't mix output2)
+                    print(f"[NOISE-READ] Primary static decryption failed. Trying alternate AD (pre-mix hash)...")
                     alt_found = False
-                    for idx, key in enumerate(getattr(self, 'candidate_cipher_keys', [])):
+                    
+                    if self.hash_state_before_mix is not None:
                         try:
                             tmp_cipher = NoiseCipherState()
-                            tmp_cipher.initialize_key(key)
-                            # Try same variants as NoiseCipherState.decrypt would
-                            plaintext = tmp_cipher.decrypt(static_data, self.hash_state)
-                            # Success
-                            print(f"[NOISE-READ] ✓ Alt decrypt succeeded with candidate #{idx}")
-                            # Adopt this key for ongoing cipher state
-                            self.cipher_state.initialize_key(key)
-                            # Mix the full ciphertext into hash (match _decrypt_and_hash semantics)
-                            self._mix_hash(static_data)
+                            tmp_cipher.initialize_key(self.cipher_state.key)
+                            plaintext = tmp_cipher.decrypt(static_data, self.hash_state_before_mix)
+                            # Success with alternate AD!
+                            print(f"[NOISE-READ] ✓ Decryption succeeded with pre-mix hash AD!")
                             self.remote_static_public = X25519PublicKey.from_public_bytes(plaintext)
+                            # Mix the full ciphertext into hash USING the pre-mix hash state
+                            self.hash_state = self.hash_state_before_mix
+                            self._mix_hash(static_data)
                             alt_found = True
-                            break
                         except Exception as ex:
-                            # continue trying
-                            print(f"[NOISE-READ] candidate #{idx} failed: {type(ex).__name__}")
-                            continue
+                            print(f"[NOISE-READ] Pre-mix hash AD also failed: {type(ex).__name__}")
+                    
+                    # If still not found, try candidate keys
+                    if not alt_found:
+                        print(f"[NOISE-READ] Trying {len(getattr(self, 'candidate_cipher_keys', []))} alternative derived keys...")
+                        for idx, key in enumerate(getattr(self, 'candidate_cipher_keys', [])):
+                            # Try with both AD values (current hash and pre-mix hash)
+                            for ad_label, ad_value in [("current", self.hash_state), ("pre-mix", self.hash_state_before_mix)]:
+                                if ad_value is None:
+                                    continue
+                                try:
+                                    tmp_cipher = NoiseCipherState()
+                                    tmp_cipher.initialize_key(key)
+                                    plaintext = tmp_cipher.decrypt(static_data, ad_value)
+                                    # Success
+                                    print(f"[NOISE-READ] ✓ Alt decrypt succeeded with candidate #{idx} ({ad_label} AD)")
+                                    # Adopt this key for ongoing cipher state
+                                    self.cipher_state.initialize_key(key)
+                                    # Restore the AD that worked and mix the ciphertext
+                                    self.hash_state = ad_value
+                                    self._mix_hash(static_data)
+                                    self.remote_static_public = X25519PublicKey.from_public_bytes(plaintext)
+                                    alt_found = True
+                                    break
+                                except Exception as ex:
+                                    pass
+                            if alt_found:
+                                break
 
                     if not alt_found:
                         raise
