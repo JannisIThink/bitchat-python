@@ -118,11 +118,14 @@ class NoiseHandshakeState:
 
         # Build a small set of candidate alternative cipher keys to try when peers behave differently
         candidates = [output3]
+        
+        # Candidate 1: output2 directly (if peer uses 2-output HKDF or older variant)
+        candidates.append(output2)
 
-        # Candidate 1: Use temp_key directly (possibly peer doesn't do expand)
+        # Candidate 2: Use temp_key directly (possibly peer doesn't do expand)
         candidates.append(temp_key)
         
-        # Candidate 2: Use chaining_key directly (edge case)
+        # Candidate 3: Use chaining_key directly (edge case)
         candidates.append(self.chaining_key)
 
         # Candidate 3: HKDF variant

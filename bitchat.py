@@ -633,7 +633,9 @@ class BitchatClient:
             pass
 
         try:
-            packet = parse_bitchat_packet(data)
+            # Remove PKCS#7 padding before parsing (matching iOS implementation)
+            unpadded_data = unpad_packet(data)
+            packet = parse_bitchat_packet(unpadded_data)
 
             if packet is None:
                 debug_full_println(f"[ERROR] Failed to parse packet: decode returned None")
