@@ -1389,131 +1389,316 @@ class BitchatClient:
             debug_println(f"[NOISE] Identity announce error details: {traceback.format_exc()}")
 
     def parse_noise_identity_announcement_binary(self, data: bytes) -> dict:
-        """Parse binary format noise identity announcement matching iOS appendData format"""
+        """Parse binary format noise identity announcement - handles both iOS and Android formats"""
         try:
-            offset = 0
-
             debug_println(f"[NOISE] Parsing binary announcement, total length: {len(data)}")
             debug_println(f"[NOISE] Raw data (hex): {data.hex()}")
 
-            # Read flags byte
-            if offset >= len(data):
-                debug_println("[NOISE] Error: Not enough data for flags")
-                return None
-            flags = data[offset]
-            offset += 1
-            debug_println(f"[NOISE] Flags: 0x{flags:02x}")
-
-            # Check if previousPeerID is present (flag bit 0)
-            has_previous_peer_id = (flags & 0x01) != 0
-            debug_println(f"[NOISE] Has previous peer ID: {has_previous_peer_id}")
-
-            # Read peerID (8 bytes)
-            if offset + 8 > len(data):
-                debug_println(f"[NOISE] Error: Not enough data for peerID, need 8 bytes, have {len(data) - offset}")
-                return None
-            peer_id = data[offset:offset+8].hex()
-            offset += 8
-            debug_println(f"[NOISE] Peer ID: {peer_id}")
-
-            # Read publicKey using appendData format (1-byte length prefix for 255 max)
-            if offset >= len(data):
-                debug_println("[NOISE] Error: Not enough data for publicKey length")
-                return None
-            pub_key_len = data[offset]
-            offset += 1
-
-            if offset + pub_key_len > len(data):
-                debug_println(f"[NOISE] Error: Not enough data for publicKey, need {pub_key_len} bytes, have {len(data) - offset}")
-                return None
-            public_key = data[offset:offset+pub_key_len]
-            offset += pub_key_len
-            debug_println(f"[NOISE] Public key length: {pub_key_len}, key: {public_key.hex()}")
-
-            # Read signingPublicKey using appendData format (1-byte length prefix for 255 max)
-            if offset >= len(data):
-                debug_println("[NOISE] Error: Not enough data for signingPublicKey length")
-                return None
-            signing_key_len = data[offset]
-            offset += 1
-
-            if offset + signing_key_len > len(data):
-                debug_println(f"[NOISE] Error: Not enough data for signingPublicKey, need {signing_key_len} bytes, have {len(data) - offset}")
-                return None
-            signing_public_key = data[offset:offset+signing_key_len]
-            offset += signing_key_len
-            debug_println(f"[NOISE] Signing public key length: {signing_key_len}, key: {signing_public_key.hex()}")
-
-            # Read nickname using appendString format (1-byte length prefix for 255 max)
-            if offset >= len(data):
-                debug_println("[NOISE] Error: Not enough data for nickname length")
-                return None
-            nickname_len = data[offset]
-            offset += 1
-            debug_println(f"[NOISE] Nickname length: {nickname_len}")
-
-            nickname = ""
-            if nickname_len > 0:
-                if offset + nickname_len > len(data):
-                    debug_println(f"[NOISE] Error: Not enough data for nickname, need {nickname_len} bytes, have {len(data) - offset}")
-                    return None
-                nickname_bytes = data[offset:offset+nickname_len]
-                offset += nickname_len
-                nickname = nickname_bytes.decode('utf-8')
-                debug_println(f"[NOISE] Nickname: '{nickname}'")
-            else:
-                debug_println("[NOISE] Nickname: (empty)")
-
-            # Read timestamp using appendDate format (8-byte UInt64 in milliseconds, big-endian)
-            if offset + 8 > len(data):
-                debug_println(f"[NOISE] Error: Not enough data for timestamp, need 8 bytes, have {len(data) - offset}")
-                return None
-            timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
-            offset += 8
-            timestamp = timestamp_ms / 1000.0  # Convert from milliseconds to seconds
-            debug_println(f"[NOISE] Timestamp: {timestamp} ({timestamp_ms}ms)")
-
-            # Read previousPeerID if present (8 bytes)
-            previous_peer_id = None
-            if has_previous_peer_id:
-                if offset + 8 > len(data):
-                    debug_println("[NOISE] Error: Not enough data for previousPeerID")
-                    return None
-                previous_peer_id = data[offset:offset+8].hex()
-                offset += 8
-                debug_println(f"[NOISE] Previous peer ID: {previous_peer_id}")
-
-            # Read signature using appendData format (1-byte length prefix for 255 max)
-            if offset >= len(data):
-                debug_println("[NOISE] Error: Not enough data for signature length")
-                return None
-            signature_len = data[offset]
-            offset += 1
-
-            if offset + signature_len > len(data):
-                debug_println(f"[NOISE] Error: Not enough data for signature, need {signature_len} bytes, have {len(data) - offset}")
-                return None
-            signature = data[offset:offset+signature_len]
-            offset += signature_len
-            debug_println(f"[NOISE] Signature length: {signature_len}, sig: {signature.hex()}")
-
-            debug_println(f"[NOISE] Total parsed {offset} bytes out of {len(data)} available")
-
-            return {
-                'peerID': peer_id,
-                'publicKey': public_key.hex(),
-                'signingPublicKey': signing_public_key.hex(),
-                'nickname': nickname,
-                'timestamp': timestamp,
-                'signature': signature.hex(),
-                'previousPeerID': previous_peer_id,
-                'truncated': False
-            }
+            # Try multiple parsing strategies to handle iOS and Android formats
+            
+            # Strategy 1: iOS format - flags | peerID(8) | pubKeyLen | pubKey(32) | sigKeyLen | sigKey(32) | nicknameLen | nickname | timestamp | ...
+            result = self._try_parse_ios_format(data)
+            if result:
+                debug_println("[NOISE] Successfully parsed with iOS format")
+                return result
+            
+            # Strategy 2: Android format - flags | nicknameLen | nickname | pubKeyLen | pubKey  | sigKeyLen | sigKey | timestamp | ...
+            result = self._try_parse_android_format(data)
+            if result:
+                debug_println("[NOISE] Successfully parsed with Android format")
+                return result
+            
+            # Strategy 3: Minimal format - just the core fields, peerID derived from pubKey
+            result = self._try_parse_minimal_format(data)
+            if result:
+                debug_println("[NOISE] Successfully parsed with minimal format")
+                return result
+            
+            debug_println("[NOISE] All parsing strategies failed")
+            return None
 
         except Exception as e:
             debug_println(f"[NOISE] Error parsing binary announcement: {e}")
             import traceback
             debug_println(f"[NOISE] Binary parser error details: {traceback.format_exc()}")
+            return None
+
+    def _try_parse_ios_format(self, data: bytes) -> Optional[dict]:
+        """Try iOS format: flags | peerID(8) | pubKeyLen | pubKey | sigKeyLen | sigKey | nicknameLen | nickname | timestamp | ...
+"""
+        try:
+            offset = 0
+            
+            if len(data) < 26:  # Minimum: flags(1) + peerID(8) + pubLen(1) + pubKey(32 min) won't fit, but let's be lenient
+                return None
+            
+            # Read flags
+            flags = data[offset]
+            offset += 1
+            has_prev_id = (flags & 0x01) != 0
+            
+            # Read peerID (8 bytes) - check if this makes sense
+            peer_id = data[offset:offset+8]
+            offset += 8
+            
+            # Next byte should be a reasonable length (32 for public key is typical)
+            if offset >= len(data):
+                return None
+            
+            pub_key_len = data[offset]
+            offset += 1
+            
+            # Sanity check: public key should be 32 bytes in Noise
+            if pub_key_len != 32:
+                return None
+            
+            if offset + pub_key_len > len(data):
+                return None
+            
+            public_key = data[offset:offset+pub_key_len]
+            offset += pub_key_len
+            
+            # Next should be signing key length
+            if offset >= len(data):
+                return None
+            
+            sig_key_len = data[offset]
+            offset += 1
+            
+            # Signing key should also be 32 bytes
+            if sig_key_len != 32:
+                return None
+            
+            if offset + sig_key_len > len(data):
+                return None
+            
+            signing_key = data[offset:offset+sig_key_len]
+            offset += sig_key_len
+            
+            # Next should be nickname length
+            if offset >= len(data):
+                return None
+            
+            nickname_len = data[offset]
+            offset += 1
+            
+            if offset + nickname_len > len(data):
+                return None
+            
+            nickname = data[offset:offset+nickname_len].decode('utf-8', errors='ignore')
+            offset += nickname_len
+            
+            # Timestamp (8 bytes big-endian)
+            if offset + 8 > len(data):
+                return None
+            
+            timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
+            offset += 8
+            
+            # Read previous peer ID if flag set
+            prev_peer_id = None
+            if has_prev_id:
+                if offset + 8 > len(data):
+                    return None
+                prev_peer_id = data[offset:offset+8].hex()
+                offset += 8
+            
+            # Read signature
+            if offset >= len(data):
+                return None
+            
+            sig_len = data[offset]
+            offset += 1
+            
+            if offset + sig_len > len(data):
+                return None
+            
+            signature = data[offset:offset+sig_len]
+            
+            debug_println("[NOISE] iOS format parsed successfully")
+            return {
+                'peerID': peer_id.hex(),
+                'publicKey': public_key.hex(),
+                'signingPublicKey': signing_key.hex(),
+                'nickname': nickname,
+                'timestamp': timestamp_ms / 1000.0,
+                'signature': signature.hex(),
+                'previousPeerID': prev_peer_id,
+                'truncated': False
+            }
+        except:
+            return None
+
+    def _try_parse_android_format(self, data: bytes) -> Optional[dict]:
+        """Try Android format without fixed peerID field"""
+        try:
+            offset = 0
+            
+            if len(data) < 20:
+                return None
+            
+            # Read flags
+            flags = data[offset]
+            offset += 1
+            has_prev_id = (flags & 0x01) != 0
+            
+            # Next byte should be nickname length (typically small, < 100)
+            if offset >= len(data):
+                return None
+            
+            nickname_len = data[offset]
+            offset += 1
+            
+            # Sanity: nickname shouldn't be huge
+            if nickname_len > 255 or nickname_len > len(data) - offset:
+                return None
+            
+            # Try to read nickname
+            if nickname_len > 0:
+                try:
+                    nickname = data[offset:offset+nickname_len].decode('utf-8')
+                except:
+                    return None
+                offset += nickname_len
+            else:
+                nickname = ""
+            
+            # Next should be pub key length (32)
+            if offset >= len(data):
+                return None
+            
+            pub_key_len = data[offset]
+            offset += 1
+            
+            if pub_key_len != 32:
+                return None
+            
+            if offset + pub_key_len > len(data):
+                return None
+            
+            public_key = data[offset:offset+pub_key_len]
+            offset += pub_key_len
+            
+            # Next should be signing key length (32)
+            if offset >= len(data):
+                return None
+            
+            sig_key_len = data[offset]
+            offset += 1
+            
+            if sig_key_len != 32:
+                return None
+            
+            if offset + sig_key_len > len(data):
+                return None
+            
+            signing_key = data[offset:offset+sig_key_len]
+            offset += sig_key_len
+            
+            # Timestamp (8 bytes)
+            if offset + 8 > len(data):
+                return None
+            
+            timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
+            offset += 8
+            
+            # Previous peer ID if flag set
+            prev_peer_id = None
+            if has_prev_id:
+                if offset + 8 > len(data):
+                    return None
+                prev_peer_id = data[offset:offset+8].hex()
+                offset += 8
+            
+            # Signature
+            if offset >= len(data):
+                return None
+            
+            sig_len = data[offset]
+            offset += 1
+            
+            if offset + sig_len > len(data):
+                return None
+            
+            signature = data[offset:offset+sig_len]
+            
+            # Derive peer ID from public key
+            peer_id_derived = public_key[:8].hex()
+            
+            debug_println("[NOISE] Android format parsed successfully")
+            return {
+                'peerID': peer_id_derived,
+                'publicKey': public_key.hex(),
+                'signingPublicKey': signing_key.hex(),
+                'nickname': nickname,
+                'timestamp': timestamp_ms / 1000.0,
+                'signature': signature.hex(),
+                'previousPeerID': prev_peer_id,
+                'truncated': False
+            }
+        except:
+            return None
+
+    def _try_parse_minimal_format(self, data: bytes) -> Optional[dict]:
+        """Try minimal format: flags | pubKeyLen | pubKey | sigKeyLen | sigKey | ... (no peerID or nickname first)"""
+        try:
+            offset = 0
+            
+            if len(data) < 70:  # At least flags(1) + pubLen(1) + pubKey(32) + sigLen(1) + sigKey(32) + ...
+                return None
+            
+            # Read flags
+            flags = data[offset]
+            offset += 1
+            
+            # Try reading as pub key length
+            pub_key_len = data[offset]
+            offset += 1
+            
+            if pub_key_len != 32:
+                return None
+            
+            if offset + pub_key_len > len(data):
+                return None
+            
+            public_key = data[offset:offset+pub_key_len]
+            offset += pub_key_len
+            
+            # Signing key
+            sig_key_len = data[offset]
+            offset += 1
+            
+            if sig_key_len != 32:
+                return None
+            
+            if offset + sig_key_len > len(data):
+                return None
+            
+            signing_key = data[offset:offset+sig_key_len]
+            offset += sig_key_len
+            
+            # Timestamp
+            if offset + 8 > len(data):
+                return None
+            
+            timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
+            offset += 8
+            
+            # Derive what we can
+            peer_id_derived = public_key[:8].hex()
+            
+            debug_println("[NOISE] Minimal format parsed")
+            return {
+                'peerID': peer_id_derived,
+                'publicKey': public_key.hex(),
+                'signingPublicKey': signing_key.hex(),
+                'nickname': '',
+                'timestamp': timestamp_ms / 1000.0,
+                'signature': '',
+                'previousPeerID': None,
+                'truncated': False
+            }
+        except:
             return None
 
     def encode_noise_identity_announcement_binary(self, peer_id: str, public_key: bytes, 
