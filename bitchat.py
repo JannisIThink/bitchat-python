@@ -761,7 +761,7 @@ class BitchatClient:
                     )
 
                     identity_packet = create_bitchat_packet_with_recipient(
-                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_IDENTITY_ANNOUNCE, 
+                        self.my_peer_id, packet.sender_id_str, MessageType.ANNOUNCE, 
                         identity_payload, signature
                     )
                     await self.send_packet(identity_packet)
@@ -1530,7 +1530,7 @@ class BitchatClient:
             return None
 
     def _try_parse_android_format(self, data: bytes) -> Optional[dict]:
-        """Try Android format without fixed peerID field"""
+        """Try Android format with type markers: flags | nicknameLen | nickname | (typeA) | pubKeyLen | pubKey | (typeB) | sigKeyLen | sigKey"""
         try:
             offset = 0
             
@@ -1542,7 +1542,7 @@ class BitchatClient:
             offset += 1
             has_prev_id = (flags & 0x01) != 0
             
-            # Next byte should be nickname length (typically small, < 100)
+            # Next byte should be nickname length
             if offset >= len(data):
                 return None
             
@@ -1553,7 +1553,7 @@ class BitchatClient:
             if nickname_len > 255 or nickname_len > len(data) - offset:
                 return None
             
-            # Try to read nickname
+            # Read nickname
             if nickname_len > 0:
                 try:
                     nickname = data[offset:offset+nickname_len].decode('utf-8')
@@ -1563,15 +1563,31 @@ class BitchatClient:
             else:
                 nickname = ""
             
-            # Next should be pub key length (32)
+            # Skip unknown type/marker byte (0x02 or similar)
             if offset >= len(data):
                 return None
             
+            marker1 = data[offset]
+            offset += 1
+            # If this looks like a valid pubkey length, we skipped correctly
+            # Otherwise this might BE the pubkey length, so backtrack
+            
+            if offset >= len(data):
+                return None
+            
+            # Try to read pub key length
             pub_key_len = data[offset]
             offset += 1
             
+            # Sanity: public key should be 32 bytes
             if pub_key_len != 32:
-                return None
+                # Marker wasn't a marker, backtrack
+                offset = len(nickname.encode('utf-8')) + 2  # flags + nicklen
+                pub_key_len = data[offset]
+                offset += 1
+                
+                if pub_key_len != 32:
+                    return None
             
             if offset + pub_key_len > len(data):
                 return None
@@ -1579,13 +1595,21 @@ class BitchatClient:
             public_key = data[offset:offset+pub_key_len]
             offset += pub_key_len
             
-            # Next should be signing key length (32)
+            # Skip unknown type/marker byte (0x03 or similar)
+            if offset >= len(data):
+                return None
+            
+            marker2 = data[offset]
+            offset += 1
+            
+            # Next should be signing key length
             if offset >= len(data):
                 return None
             
             sig_key_len = data[offset]
             offset += 1
             
+            # Sanity: signing key should be 32 bytes
             if sig_key_len != 32:
                 return None
             
@@ -1595,45 +1619,24 @@ class BitchatClient:
             signing_key = data[offset:offset+sig_key_len]
             offset += sig_key_len
             
-            # Timestamp (8 bytes)
-            if offset + 8 > len(data):
-                return None
-            
-            timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
-            offset += 8
-            
-            # Previous peer ID if flag set
-            prev_peer_id = None
-            if has_prev_id:
-                if offset + 8 > len(data):
-                    return None
-                prev_peer_id = data[offset:offset+8].hex()
+            # Try to read timestamp (8 bytes, big-endian)
+            timestamp_ms = 0
+            if offset + 8 <= len(data):
+                timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
                 offset += 8
-            
-            # Signature
-            if offset >= len(data):
-                return None
-            
-            sig_len = data[offset]
-            offset += 1
-            
-            if offset + sig_len > len(data):
-                return None
-            
-            signature = data[offset:offset+sig_len]
             
             # Derive peer ID from public key
             peer_id_derived = public_key[:8].hex()
             
-            debug_println("[NOISE] Android format parsed successfully")
+            debug_println("[NOISE] Android format (with markers) parsed successfully")
             return {
                 'peerID': peer_id_derived,
                 'publicKey': public_key.hex(),
                 'signingPublicKey': signing_key.hex(),
                 'nickname': nickname,
                 'timestamp': timestamp_ms / 1000.0,
-                'signature': signature.hex(),
-                'previousPeerID': prev_peer_id,
+                'signature': '',
+                'previousPeerID': None,
                 'truncated': False
             }
         except:
@@ -2704,7 +2707,7 @@ class BitchatClient:
                                 )
 
                                 identity_packet = create_bitchat_packet_with_signature(
-                                    self.my_peer_id, MessageType.NOISE_IDENTITY_ANNOUNCE, identity_payload, signature
+                                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload, signature
                                 )
                                 await self.send_packet(identity_packet)
                             except Exception as e:
