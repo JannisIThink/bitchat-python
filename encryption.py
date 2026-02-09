@@ -117,79 +117,6 @@ class NoiseHandshakeState:
         
         self.cipher_state.initialize_key(output2)
         self._mix_hash(output2)
-
-        # Build candidate alternative cipher keys for robustness
-        # This handles edge cases where peers might implement it slightly differently
-        candidates = [output2]
-        
-        # Also generate 3-output variants for full fallback compatibility
-        try:
-            hmac3 = HMAC(temp_key, hashes.SHA256())
-            hmac3.update(output2 + b'\x03')
-            output3_alt = hmac3.finalize()
-            candidates.append(output3_alt)
-            print(f"[NOISE-MIX] Also trying 3-output variant as candidate: {output3_alt.hex()[:32]}...")
-        except Exception:
-            pass
-
-        # Candidate: Use temp_key directly (edge case)
-        candidates.append(temp_key)
-        
-        # Candidate: Use chaining_key directly
-        candidates.append(self.chaining_key)
-
-        # Try HKDF-SHA256 library function
-        try:
-            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-            hk = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=self.chaining_key,
-                info=b''
-            )
-            hk_key = hk.derive(input_key_material)
-            candidates.append(hk_key)
-        except Exception:
-            pass
-
-        # Candidate: Alternate nonce/output order
-        try:
-            hmac_alt = HMAC(temp_key, hashes.SHA256())
-            hmac_alt.update(b'\x02' + output1)
-            alt_key = hmac_alt.finalize()
-            candidates.append(alt_key)
-        except Exception:
-            pass
-
-        # Candidate 6: HMAC(temp_key, "") - without expand
-        try:
-            hmac_empty = HMAC(temp_key, hashes.SHA256())
-            hmac_empty.update(b'')
-            alt_empty = hmac_empty.finalize()
-            candidates.append(alt_empty)
-        except Exception:
-            pass
-
-        # Candidate 7: HMAC(IKM, CK) - reversed key/data
-        try:
-            hmac_rev = HMAC(input_key_material, hashes.SHA256())
-            hmac_rev.update(self.chaining_key)
-            alt_rev = hmac_rev.finalize()
-            candidates.append(alt_rev)
-        except Exception:
-            pass
-
-        # Deduplicate while preserving order
-        seen = set()
-        dedup = []
-        for k in candidates:
-            h = k.hex()
-            if h not in seen:
-                dedup.append(k)
-                seen.add(h)
-
-        self.candidate_cipher_keys = dedup
-        print(f"[NOISE-MIX] Generated {len(self.candidate_cipher_keys)} candidate cipher keys for fallback")
     
     def _mix_hash(self, data: bytes):
         """Mix data into handshake hash"""
@@ -229,11 +156,11 @@ class NoiseHandshakeState:
         self.cipher_state.initialize_key(output3)
     
     def _encrypt_and_hash(self, plaintext: bytes) -> bytes:
-        """Encrypt plaintext and mix ciphertext into hash"""
+        """Encrypt plaintext and mix ciphertext into hash (handshake mode - NO nonce prefix)"""
         if self.cipher_state.has_key():
-            output = self.cipher_state.encrypt(plaintext, self.hash_state)
-            # output = [4-byte nonce prefix][encrypted data]; mix the FULL ciphertext
-            # bytes so both sides hash the same data (includes nonce prefix).
+            output = self.cipher_state.encrypt_handshake(plaintext, self.hash_state)
+            # During handshake, NO nonce prefix is added, just: [encrypted data][16-byte MAC]
+            # Mix the full ciphertext into hash
             self._mix_hash(output)
             return output
         else:
@@ -241,15 +168,15 @@ class NoiseHandshakeState:
             return plaintext
     
     def _decrypt_and_hash(self, ciphertext_bytes: bytes) -> bytes:
-        """Decrypt ciphertext and mix it into hash.
+        """Decrypt ciphertext and mix it into hash (handshake mode - NO nonce prefix).
         
-        CRITICAL: Hash the FULL ciphertext bytes as received (with nonce prefix if present),
-        NOT a substring. This must match the peer's implementation.
+        CRITICAL: During HANDSHAKE, Noise protocol uses nonce=0 with NO prefix,
+        just the encrypted data + MAC tag.
         """
         if self.cipher_state.has_key():
             # Use the current handshake hash as associated data (matches _encrypt_and_hash)
-            plaintext = self.cipher_state.decrypt(ciphertext_bytes, self.hash_state)
-            # IMPORTANT: Mix the FULL ciphertext_bytes into the hash, regardless of prefix
+            plaintext = self.cipher_state.decrypt_handshake(ciphertext_bytes, self.hash_state)
+            # Mix the full ciphertext_bytes into the hash
             self._mix_hash(ciphertext_bytes)
             return plaintext
         else:
@@ -369,20 +296,17 @@ class NoiseHandshakeState:
                 print(f"[NOISE-READ] Remote ephemeral (full 64 hex): {ephemeral_data.hex()}")
             
             elif pattern == 's':
-                # Read static key (may be encrypted)
-                # With nonce extraction: 4 (nonce) + 32 (key) + 16 (tag) = 52 bytes encrypted
-                # Without extracted nonce (common variant): 32 (key) + 16 (tag) = 48 bytes
-                # Plain: 32 bytes
+                # Read static key (encrypted if cipher is initialized)
+                # CRITICAL: During HANDSHAKE, Noise protocol uses NO 4-byte nonce prefix
+                # Encrypted static format: [32-byte encrypted key][16-byte MAC] = 48 bytes
+                # (The 4-byte nonce prefix is ONLY used during TRANSPORT phase after handshake)
                 if self.cipher_state.has_key():
-                    if len(buffer) >= 52:
-                        key_length = 52
-                    elif len(buffer) >= 48:
-                        # Peer likely omitted 4-byte nonce prefix; accept 48-byte encrypted static
-                        key_length = 48
-                    else:
-                        raise NoiseError("Invalid message: insufficient data for static key")
+                    key_length = 48  # 32-byte encrypted key + 16-byte MAC tag (no nonce prefix during handshake)
                 else:
-                    key_length = 32
+                    key_length = 32  # Unencrypted static key
+
+                if len(buffer) < key_length:
+                    raise NoiseError(f"Invalid message: insufficient data for static key (expected {key_length}, got {len(buffer)})")
 
                 static_data = buffer[:key_length]
                 buffer = buffer[key_length:]
@@ -399,7 +323,8 @@ class NoiseHandshakeState:
                     print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
                     print(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
                 except Exception as e:
-                    # Primary decryption failed — try with hash_state_before_mix (if peer doesn't mix output2)
+                    # If decryption fails, try with pre-mix hash as AD
+                    # (handles edge case where peer mixes differently)
                     print(f"[NOISE-READ] Primary static decryption failed. Trying alternate AD (pre-mix hash)...")
                     alt_found = False
                     
@@ -418,33 +343,7 @@ class NoiseHandshakeState:
                         except Exception as ex:
                             print(f"[NOISE-READ] Pre-mix hash AD also failed: {type(ex).__name__}")
                     
-                    # If still not found, try candidate keys
-                    if not alt_found:
-                        print(f"[NOISE-READ] Trying {len(getattr(self, 'candidate_cipher_keys', []))} alternative derived keys...")
-                        for idx, key in enumerate(getattr(self, 'candidate_cipher_keys', [])):
-                            # Try with both AD values (current hash and pre-mix hash)
-                            for ad_label, ad_value in [("current", self.hash_state), ("pre-mix", self.hash_state_before_mix)]:
-                                if ad_value is None:
-                                    continue
-                                try:
-                                    tmp_cipher = NoiseCipherState()
-                                    tmp_cipher.initialize_key(key)
-                                    plaintext = tmp_cipher.decrypt(static_data, ad_value)
-                                    # Success
-                                    print(f"[NOISE-READ] ✓ Alt decrypt succeeded with candidate #{idx} ({ad_label} AD)")
-                                    # Adopt this key for ongoing cipher state
-                                    self.cipher_state.initialize_key(key)
-                                    # Restore the AD that worked and mix the ciphertext
-                                    self.hash_state = ad_value
-                                    self._mix_hash(static_data)
-                                    self.remote_static_public = X25519PublicKey.from_public_bytes(plaintext)
-                                    alt_found = True
-                                    break
-                                except Exception as ex:
-                                    pass
-                            if alt_found:
-                                break
-
+                    # No more fallback attempts - raise the error
                     if not alt_found:
                         raise
             
@@ -700,6 +599,46 @@ class NoiseCipherState:
         bit_index = window_index % 8
         
         self.replay_window[byte_index] |= (1 << bit_index)
+    
+    def encrypt_handshake(self, plaintext: bytes, associated_data: bytes = b'') -> bytes:
+        """Encrypt plaintext during HANDSHAKE phase (NO 4-byte nonce prefix).
+        
+        During Noise handshake, the protocol uses nonce=0 but DOES NOT add the 4-byte
+        extracted nonce prefix. The output is simply: [encrypted data][16-byte MAC]
+        
+        This matches the Android implementation which uses cipher.encryptWithAd() directly.
+        """
+        if not self.has_key():
+            raise NoiseError("Cipher not initialized for handshake")
+        
+        # Handshake always uses nonce=0 (it does not increment during handshake)
+        nonce = b'\x00\x00\x00\x00' + b'\x00' * 8  # 12-byte zero nonce
+        
+        cipher = ChaCha20Poly1305(self.key)
+        ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
+        
+        # CRITICAL: Return ONLY the ciphertext (including 16-byte MAC tag)
+        # NO 4-byte nonce prefix is added during handshake phase
+        return ciphertext
+    
+    def decrypt_handshake(self, ciphertext: bytes, associated_data: bytes = b'') -> bytes:
+        """Decrypt ciphertext during HANDSHAKE phase (NO 4-byte nonce prefix extraction).
+        
+        During Noise handshake, the protocol uses nonce=0 and does NOT add the 4-byte
+        extracted nonce prefix. The input is simply: [encrypted data][16-byte MAC]
+        
+        This matches the Android implementation which uses cipher.encryptWithAd() directly.
+        """
+        if not self.has_key():
+            raise NoiseError("Cipher not initialized for handshake")
+        
+        # Handshake always uses nonce=0 (it does not increment during handshake)
+        nonce = b'\x00\x00\x00\x00' + b'\x00' * 8  # 12-byte zero nonce
+        
+        cipher = ChaCha20Poly1305(self.key)
+        plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
+        
+        return plaintext
 
 @dataclass
 class NoiseSession:
