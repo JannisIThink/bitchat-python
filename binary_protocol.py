@@ -141,6 +141,10 @@ class BinaryProtocol:
                 hop_bytes = hop if len(hop) == 8 else (hop + b'\x00' * (8 - len(hop)))[:8]
                 variable_data.extend(hop_bytes)
 
+        # Track where payload content starts (after sender/recipient/route)
+        # payload_length must exclude IDs/route/signature to match Android/iOS
+        payload_content_start = len(variable_data)
+
         # Original size (if IS_COMPRESSED flag)
         if flags & FLAG_IS_COMPRESSED:
             original_size = len(packet.payload)
@@ -152,8 +156,9 @@ class BinaryProtocol:
         # Payload
         variable_data.extend(payload_to_send)
 
-        # Calculate payload length (all variable data except header)
-        payload_length = len(variable_data)
+        # payload_length = ONLY payload content (excludes sender/recipient/route/signature)
+        # Matches Android/iOS: payloadDataSize = payload.size + sizeFieldBytes
+        payload_length = len(variable_data) - payload_content_start
 
         # Build header
         header = bytearray(header_size)
@@ -289,13 +294,11 @@ class BinaryProtocol:
                 original_size = struct.unpack('>H', data[offset:offset+2])[0]
                 offset += 2
 
-        # Payload length calculation differs by version:
-        # v2 (Python): payload_length includes ALL variable data (sender, recipient, etc.)
-        # v1 (Android/iOS): payload_length is the actual payload size only
-        if version >= 2:
-            header_size = V2_HEADER_SIZE
-            bytes_used_for_optional_fields = offset - header_size
-            remaining_payload_length = payload_length - bytes_used_for_optional_fields
+        # payload_length excludes sender/recipient/route/signature (matches Android/iOS)
+        # For compressed data: payload_length includes original_size field (already read above)
+        if flags & FLAG_IS_COMPRESSED:
+            original_size_field_len = 4 if version >= 2 else 2
+            remaining_payload_length = payload_length - original_size_field_len
         else:
             remaining_payload_length = payload_length
         
