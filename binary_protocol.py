@@ -289,11 +289,15 @@ class BinaryProtocol:
                 original_size = struct.unpack('>H', data[offset:offset+2])[0]
                 offset += 2
 
-        # Payload: payload_length is total length of all variable data
-        # We've already read some optional fields, so calculate remaining bytes for payload
-        header_size = V2_HEADER_SIZE if version >= 2 else V1_HEADER_SIZE
-        bytes_used_for_optional_fields = offset - header_size
-        remaining_payload_length = payload_length - bytes_used_for_optional_fields
+        # Payload length calculation differs by version:
+        # v2 (Python): payload_length includes ALL variable data (sender, recipient, etc.)
+        # v1 (Android/iOS): payload_length is the actual payload size only
+        if version >= 2:
+            header_size = V2_HEADER_SIZE
+            bytes_used_for_optional_fields = offset - header_size
+            remaining_payload_length = payload_length - bytes_used_for_optional_fields
+        else:
+            remaining_payload_length = payload_length
         
         if remaining_payload_length < 0:
             return None

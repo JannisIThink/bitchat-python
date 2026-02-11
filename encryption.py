@@ -279,10 +279,12 @@ class NoiseHandshakeState:
                     shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                 self._mix_key(shared)
         
-        # Encrypt payload (only if non-empty)
-        if payload:
-            encrypted_payload = self._encrypt_and_hash(payload)
-            message_buffer.extend(encrypted_payload)
+        # Per Noise spec: ALWAYS call EncryptAndHash(payload), even if empty.
+        # Without a key: MixHash(empty), returns b'' (no extra bytes).
+        # With a key: encrypts empty → 16-byte MAC, then MixHash(MAC).
+        # This matches noise-java (Android) which always appends encrypted payload.
+        encrypted_payload = self._encrypt_and_hash(payload)
+        message_buffer.extend(encrypted_payload)
         
         self.current_pattern += 1
         return bytes(message_buffer)
@@ -369,11 +371,11 @@ class NoiseHandshakeState:
                         shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                     self._mix_key(shared)
         
-        # Decrypt payload (only if remainder exists)
-        if buffer:
-            payload = self._decrypt_and_hash(buffer)
-        else:
-            payload = b''
+        # Per Noise spec: ALWAYS call DecryptAndHash(remaining), even if empty.
+        # Without a key: MixHash(empty), returns b'' (no extra bytes consumed).
+        # With a key: expects at least 16-byte MAC in buffer.
+        # This matches noise-java (Android) which always decrypts trailing payload.
+        payload = self._decrypt_and_hash(buffer)
         self.current_pattern += 1
         
         return payload
