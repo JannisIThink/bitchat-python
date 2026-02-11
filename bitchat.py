@@ -1117,67 +1117,84 @@ class BitchatClient:
             # Convert bytearray to bytes for encryption service
             payload_bytes = bytes(packet.payload) if isinstance(packet.payload, bytearray) else packet.payload
 
-            # Decrypt the Noise encrypted payload using the improved method
+            # Decrypt the Noise encrypted payload
             decrypted_payload = self.encryption_service.decrypt_from_peer(packet.sender_id_str, payload_bytes)
             debug_println(f"[NOISE] Successfully decrypted {len(decrypted_payload)} bytes from {packet.sender_id_str}")
 
-            # The decrypted payload should be a complete BitchatPacket (matching Swift implementation)
-            # Swift creates: BitchatPacket(type: MessageType.message, ...) and encrypts the whole packet
-
             try:
-                # Check if the decrypted data starts with version 1 (BitchatPacket)
-                if len(decrypted_payload) > 0 and decrypted_payload[0] == 1:
-                    # Parse the decrypted data as a complete BitchatPacket
-                    inner_packet = parse_bitchat_packet(decrypted_payload)
-                    if inner_packet:
-                        debug_println(f"[NOISE] Decrypted inner packet: type={inner_packet.msg_type.name if hasattr(inner_packet.msg_type, 'name') else inner_packet.msg_type}, sender={inner_packet.sender_id_str}")
+                # Parse as NoisePayload: [type_byte][data]
+                # This matches Android/iOS NoisePayload format exactly
+                if len(decrypted_payload) < 1:
+                    debug_println(f"[NOISE] Decrypted payload too short")
+                    return
 
-                        # Verify this is a MESSAGE packet (as created by Swift)
-                        if inner_packet.msg_type == MessageType.MESSAGE:
-                            # Parse the message payload from the inner packet
-                            try:
-                                message = parse_bitchat_message_payload(inner_packet.payload)
+                payload_type = decrypted_payload[0]
+                payload_data = decrypted_payload[1:] if len(decrypted_payload) > 1 else b''
 
-                                # Check for duplicates
-                                if message.id not in self.processed_messages:
-                                    self.bloom.add(message.id)
-                                    self.processed_messages.add(message.id)
+                debug_println(f"[NOISE] NoisePayload type=0x{payload_type:02x}, data={len(payload_data)} bytes")
 
-                                    # Display the message as private
-                                    await self.display_message(message, packet, True)
+                if payload_type == NoisePayloadType.PRIVATE_MESSAGE:  # 0x01
+                    # Parse TLV: [type=0x00][len][messageID][type=0x01][len][content]
+                    message_id = None
+                    content = None
+                    offset = 0
+                    while offset + 2 <= len(payload_data):
+                        tlv_type = payload_data[offset]; offset += 1
+                        tlv_len = payload_data[offset]; offset += 1
+                        if offset + tlv_len > len(payload_data):
+                            break
+                        tlv_value = payload_data[offset:offset+tlv_len]; offset += tlv_len
+                        if tlv_type == 0x00:  # MESSAGE_ID
+                            message_id = tlv_value.decode('utf-8')
+                        elif tlv_type == 0x01:  # CONTENT
+                            content = tlv_value.decode('utf-8')
 
-                                    # Send ACK
-                                    await self.send_delivery_ack(message.id, packet.sender_id_str, True)
-                                else:
-                                    debug_println(f"[DUPLICATE] Ignoring duplicate encrypted message: {message.id}")
+                    if message_id and content:
+                        debug_println(f"[NOISE] Private message: id={message_id[:16]}..., content={content[:30]}...")
 
-                            except Exception as e:
-                                debug_println(f"[NOISE] Failed to parse inner message payload: {e}")
+                        # Check for duplicates
+                        if message_id not in self.processed_messages:
+                            self.bloom.add(message_id)
+                            self.processed_messages.add(message_id)
+
+                            # Get sender nickname
+                            sender_nick = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str[:8]
+
+                            # Create BitchatMessage for display
+                            message = BitchatMessage(
+                                id=message_id,
+                                content=content,
+                                sender=sender_nick,
+                                channel=None,
+                                is_encrypted=False,
+                                encrypted_content=None
+                            )
+
+                            await self.display_message(message, packet, True)
+
+                            # Send ACK
+                            await self.send_delivery_ack(message_id, packet.sender_id_str, True)
                         else:
-                            debug_println(f"[NOISE] Unexpected inner packet type: {inner_packet.msg_type}, expected MESSAGE")
-                            # Handle other types of inner packets if needed
-                            await self.handle_packet(inner_packet, decrypted_payload)
+                            debug_println(f"[DUPLICATE] Ignoring duplicate encrypted message: {message_id}")
                     else:
-                        debug_println(f"[NOISE] Failed to parse decrypted data as BitchatPacket")
+                        debug_println(f"[NOISE] Failed to parse PrivateMessagePacket TLV")
+
+                elif payload_type == NoisePayloadType.DELIVERED:  # 0x03
+                    # Delivery ACK: data is message ID as UTF-8
+                    ack_message_id = payload_data.decode('utf-8')
+                    debug_println(f"[NOISE] Received delivery ACK for message: {ack_message_id}")
+                    self.delivery_tracker.confirm_delivery(ack_message_id)
+
+                elif payload_type == NoisePayloadType.READ_RECEIPT:  # 0x02
+                    # Read receipt: data is message ID as UTF-8
+                    read_message_id = payload_data.decode('utf-8')
+                    debug_println(f"[NOISE] Received read receipt for message: {read_message_id}")
+
                 else:
-                    # Handle non-BitchatPacket data (likely JSON acknowledgments or receipts)
-                    debug_println(f"[NOISE] Decrypted data does not start with version 1, likely acknowledgment/receipt")
-                    try:
-                        # Try to parse as JSON (iOS read receipts/acks start with newline + JSON)
-                        data_str = decrypted_payload.decode('utf-8').strip()
-                        if data_str.startswith('{') and data_str.endswith('}'):
-                            import json
-                            ack_data = json.loads(data_str)
-                            debug_println(f"[NOISE] Received acknowledgment: {ack_data}")
-                            # Handle acknowledgment data if needed
-                        else:
-                            debug_println(f"[NOISE] Unknown decrypted data format")
-                    except Exception as json_e:
-                        debug_println(f"[NOISE] Failed to parse as JSON acknowledgment: {json_e}")
+                    debug_println(f"[NOISE] Unknown NoisePayload type: 0x{payload_type:02x}")
 
             except Exception as e:
-                debug_println(f"[NOISE] Error parsing decrypted inner packet: {e}")
-                # Log the first few bytes for debugging
+                debug_println(f"[NOISE] Error parsing NoisePayload: {e}")
                 preview = decrypted_payload[:50] if len(decrypted_payload) >= 50 else decrypted_payload
                 debug_println(f"[NOISE] Decrypted data preview: {preview.hex() if isinstance(preview, bytes) else preview}")
 
@@ -1763,52 +1780,70 @@ class BitchatClient:
         return bytes(data)
 
     async def send_delivery_ack(self, message_id: str, sender_id: str, is_private: bool):
-        """Send delivery acknowledgment"""
+        """Send delivery acknowledgment matching Android/iOS NoisePayload format"""
         ack_id = f"{message_id}-{self.my_peer_id}"
         if not self.delivery_tracker.should_send_ack(ack_id):
             return
 
         debug_println(f"[ACK] Sending delivery ACK for message {message_id}")
 
-        ack = DeliveryAck(
-            message_id,
-            str(uuid.uuid4()),
-            self.my_peer_id,
-            self.nickname,
-            int(time.time() * 1000),
-            1
-        )
+        if is_private and self.encryption_service.is_session_established(sender_id):
+            # Send as NoisePayload via NOISE_ENCRYPTED packet (matching Android/iOS)
+            # Format: [0x03 DELIVERED][messageID as UTF-8]
+            message_id_bytes = message_id.encode('utf-8')
+            noise_payload = bytearray()
+            noise_payload.append(NoisePayloadType.DELIVERED)  # 0x03
+            noise_payload.extend(message_id_bytes)
 
-        ack_payload = json.dumps({
-            'originalMessageID': ack.original_message_id,
-            'ackID': ack.ack_id,
-            'recipientID': ack.recipient_id,
-            'recipientNickname': ack.recipient_nickname,
-            'timestamp': ack.timestamp,
-            'hopCount': ack.hop_count
-        }).encode()
-
-        # Encrypt if private
-        if is_private:
             try:
-                ack_payload = self.encryption_service.encrypt(ack_payload, sender_id)
-            except:
-                pass
+                encrypted = self.encryption_service.encrypt_for_peer(sender_id, bytes(noise_payload))
 
-        # Send ACK packet
-        ack_packet = create_bitchat_packet_with_recipient(
-            self.my_peer_id,
-            sender_id,
-            MessageType.DELIVERY_ACK,
-            ack_payload,
-            None
-        )
+                ack_packet = create_bitchat_packet_with_recipient(
+                    self.my_peer_id,
+                    sender_id,
+                    MessageType.NOISE_ENCRYPTED,
+                    encrypted,
+                    None
+                )
 
-        # Set TTL to 3
-        ack_packet_data = bytearray(ack_packet)
-        ack_packet_data[2] = 3
+                # Set TTL to 3
+                ack_packet_data = bytearray(ack_packet)
+                ack_packet_data[2] = 3
+                await self.send_packet(bytes(ack_packet_data))
+            except Exception as e:
+                debug_println(f"[ACK] Failed to encrypt delivery ACK: {e}")
+        else:
+            # Fallback: unencrypted DELIVERY_ACK packet
+            ack = DeliveryAck(
+                message_id,
+                str(uuid.uuid4()),
+                self.my_peer_id,
+                self.nickname,
+                int(time.time() * 1000),
+                1
+            )
 
-        await self.send_packet(bytes(ack_packet_data))
+            ack_payload = json.dumps({
+                'originalMessageID': ack.original_message_id,
+                'ackID': ack.ack_id,
+                'recipientID': ack.recipient_id,
+                'recipientNickname': ack.recipient_nickname,
+                'timestamp': ack.timestamp,
+                'hopCount': ack.hop_count
+            }).encode()
+
+            ack_packet = create_bitchat_packet_with_recipient(
+                self.my_peer_id,
+                sender_id,
+                MessageType.DELIVERY_ACK,
+                ack_payload,
+                None
+            )
+
+            # Set TTL to 3
+            ack_packet_data = bytearray(ack_packet)
+            ack_packet_data[2] = 3
+            await self.send_packet(bytes(ack_packet_data))
 
     async def send_channel_announce(self, channel: str, is_protected: bool, key_commitment: Optional[str]):
         """Send channel announcement"""
@@ -2557,38 +2592,37 @@ class BitchatClient:
 
         debug_println(f"[PRIVATE] Sending encrypted message to {target_nickname}")
 
-        # Create message payload - don't set is_encrypted=True since encryption happens at Noise layer
-        payload, message_id = create_bitchat_message_payload_full(
-            self.nickname, content, None, True, self.my_peer_id, False, None
-        )
+        # Create NoisePayload: [0x01 PRIVATE_MESSAGE][TLV{messageID, content}]
+        # This matches Android/iOS NoisePayload format exactly
+        message_id = message_id if message_id else str(uuid.uuid4())
+        message_id_bytes = message_id.encode('utf-8')
+        content_bytes = content.encode('utf-8')
 
-        debug_println(f"[PRIVATE] Created message payload: {len(payload)} bytes")
-        debug_println(f"[PRIVATE] Message payload hex: {payload.hex()}")
+        # Build TLV payload (PrivateMessagePacket) matching Android/iOS:
+        # [type=0x00][length][messageID] [type=0x01][length][content]
+        tlv_data = bytearray()
+        tlv_data.append(0x00)  # TLV type: MESSAGE_ID
+        tlv_data.append(len(message_id_bytes))
+        tlv_data.extend(message_id_bytes)
+        tlv_data.append(0x01)  # TLV type: CONTENT
+        tlv_data.append(len(content_bytes))
+        tlv_data.extend(content_bytes)
+
+        # Wrap in NoisePayload: [type_byte][tlv_data]
+        noise_payload = bytearray()
+        noise_payload.append(NoisePayloadType.PRIVATE_MESSAGE)  # 0x01
+        noise_payload.extend(tlv_data)
+
+        debug_println(f"[PRIVATE] Created NoisePayload: {len(noise_payload)} bytes")
+        debug_println(f"[PRIVATE] NoisePayload hex: {bytes(noise_payload).hex()}")
 
         # Track for delivery
         self.delivery_tracker.track_message(message_id, content, True)
 
-        # Create INNER packet (BitchatPacket with MESSAGE type) that will be encrypted
-        # This matches Swift implementation: BitchatPacket(type: MessageType.message, ...)
-        inner_packet = create_bitchat_packet_with_recipient(
-            self.my_peer_id,
-            target_peer_id,
-            MessageType.MESSAGE,
-            payload,
-            None
-        )
-
-        # Set TTL for inner packet (matching Swift's adaptiveTTL behavior)
-        inner_packet_data = bytearray(inner_packet)
-        inner_packet_data[2] = 7  # TTL for inner packet
-        inner_packet = bytes(inner_packet_data)
-
-        debug_println(f"[PRIVATE] Created inner packet: {len(inner_packet)} bytes")
-
         try:
-            # Encrypt the ENTIRE inner packet using Noise (matching Swift)
-            encrypted = self.encryption_service.encrypt_for_peer(target_peer_id, inner_packet)
-            debug_println(f"[PRIVATE] Encrypted inner packet: {len(encrypted)} bytes")
+            # Encrypt the NoisePayload (matching Android/iOS)
+            encrypted = self.encryption_service.encrypt_for_peer(target_peer_id, bytes(noise_payload))
+            debug_println(f"[PRIVATE] Encrypted NoisePayload: {len(encrypted)} bytes")
 
             # Create outer Noise encrypted packet
             packet = create_bitchat_packet_with_recipient(
