@@ -70,16 +70,27 @@ class NoiseHandshakeState:
         ]
     
     def _initialize_symmetric_state(self):
-        """Initialize symmetric state with protocol name"""
+        """Initialize symmetric state with protocol name.
+        
+        Per Noise spec Initialize():
+          1. h = protocol_name (padded or hashed to HASHLEN)
+          2. ck = h
+          3. MixHash(prologue)  -- with empty prologue: h = SHA256(h)
+        """
         protocol_name = NOISE_PROTOCOL_NAME.encode('utf-8')
         if len(protocol_name) <= 32:
             self.hash_state = protocol_name + b'\x00' * (32 - len(protocol_name))
         else:
             self.hash_state = hashlib.sha256(protocol_name).digest()
         self.chaining_key = self.hash_state
-        self.hash_state_before_mix = self.hash_state  # Initially same
+        
+        # Mix empty prologue into hash (required by Noise spec, matches Android/iOS)
+        # Android: HandshakeState.start() calls symmetric.mixHash(emptyPrologue, 0, 0)
+        self._mix_hash(b'')
+        
+        self.hash_state_before_mix = self.hash_state
         print(f"[NOISE-INIT] Protocol name: {NOISE_PROTOCOL_NAME}")
-        print(f"[NOISE-INIT] Initial hash_state (32 bytes): {self.hash_state.hex()}")
+        print(f"[NOISE-INIT] Initial hash_state after prologue mix (32 bytes): {self.hash_state.hex()}")
         print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
     
     def _mix_key(self, input_key_material: bytes):
@@ -327,29 +338,8 @@ class NoiseHandshakeState:
                     print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
                     print(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
                 except Exception as e:
-                    # If decryption fails, try with pre-mix hash as AD
-                    # (handles edge case where peer mixes differently)
-                    print(f"[NOISE-READ] Primary static decryption failed. Trying alternate AD (pre-mix hash)...")
-                    alt_found = False
-                    
-                    if self.hash_state_before_mix is not None:
-                        try:
-                            tmp_cipher = NoiseCipherState()
-                            tmp_cipher.initialize_key(self.cipher_state.key)
-                            plaintext = tmp_cipher.decrypt(static_data, self.hash_state_before_mix)
-                            # Success with alternate AD!
-                            print(f"[NOISE-READ] ✓ Decryption succeeded with pre-mix hash AD!")
-                            self.remote_static_public = X25519PublicKey.from_public_bytes(plaintext)
-                            # Mix the full ciphertext into hash USING the pre-mix hash state
-                            self.hash_state = self.hash_state_before_mix
-                            self._mix_hash(static_data)
-                            alt_found = True
-                        except Exception as ex:
-                            print(f"[NOISE-READ] Pre-mix hash AD also failed: {type(ex).__name__}")
-                    
-                    # No more fallback attempts - raise the error
-                    if not alt_found:
-                        raise
+                    print(f"[NOISE-READ] Static key decryption failed: {type(e).__name__}: {e}")
+                    raise
             
             elif pattern in ['ee', 'es', 'se']:
                 # Perform DH operations (same as write_message)
@@ -443,7 +433,6 @@ class NoiseCipherState:
     def __init__(self):
         self.key = None
         self.nonce = 0
-        self.use_extracted_nonce = True  # BitChat always uses extracted nonce
         self.highest_received_nonce = 0
         self.replay_window_size = 1024
         self.replay_window = [0] * 128  # 1024 bits = 128 bytes
@@ -486,98 +475,30 @@ class NoiseCipherState:
         return result
     
     def decrypt(self, ciphertext_with_nonce: bytes, associated_data: bytes = b'') -> bytes:
-        """Decrypt ciphertext with extracted nonce (smart reordering for compatibility).
+        """Decrypt ciphertext with extracted nonce for transport phase.
         
-        Input: [4-byte nonce][encrypted data][16-byte MAC] or [encrypted data][16-byte MAC]
-        
-        Strategy:
-        - SHORT blocks (<52 bytes, typical handshake): try no-prefix FIRST (Android handshake style)
-        - LONG blocks (>=52 bytes, typical transport): try 4-byte prefix FIRST
-        Try multiple variants and nonces to handle cross-platform compatibility.
+        Input: [4-byte nonce (big-endian)][encrypted data][16-byte MAC]
         """
         if not self.has_key():
             raise NoiseError("Cipher not initialized")
         
-        attempts = []
-        is_short_block = len(ciphertext_with_nonce) < 52
+        if len(ciphertext_with_nonce) < 4 + 16:
+            raise NoiseError(f"Ciphertext too short: {len(ciphertext_with_nonce)} bytes")
         
-        # For short blocks (handshake): prioritize NO-PREFIX (Android doesn't extract nonce in handshake)
-        if is_short_block and len(ciphertext_with_nonce) >= 16:
-            # HANDSHAKE PRIORITY 1-4: Try nonce 0 and 1 with hash AD and empty AD
-            for candidate_nonce in [0, 1]:
-                # With hash AD
-                try:
-                    nonce = b'\x00\x00\x00\x00' + candidate_nonce.to_bytes(8, byteorder='little')
-                    cipher = ChaCha20Poly1305(self.key)
-                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
-                    self._mark_nonce_as_seen(candidate_nonce)
-                    self._last_decryption_used_prefix = False
-                    print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce={candidate_nonce}, with hash AD")
-                    return plaintext
-                except Exception as ex:
-                    attempts.append(f"SHORT:no-prefix,n={candidate_nonce},AD: {type(ex).__name__}")
-                
-                # With empty AD
-                try:
-                    nonce = b'\x00\x00\x00\x00' + candidate_nonce.to_bytes(8, byteorder='little')
-                    cipher = ChaCha20Poly1305(self.key)
-                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, b'')
-                    self._mark_nonce_as_seen(candidate_nonce)
-                    self._last_decryption_used_prefix = False
-                    print(f"[NOISE-CIPHER] ✓ SUCCESS (short/handshake): no prefix, nonce={candidate_nonce}, empty AD")
-                    return plaintext
-                except Exception as ex:
-                    attempts.append(f"SHORT:no-prefix,n={candidate_nonce},empty: {type(ex).__name__}")
+        # Extract 4-byte big-endian nonce prefix
+        nonce_bytes = ciphertext_with_nonce[:4]
+        ciphertext = ciphertext_with_nonce[4:]
+        received_nonce = int.from_bytes(nonce_bytes, byteorder='big')
         
-        # For all blocks (or if short-block no-prefix failed): try 4-byte prefix
-        if len(ciphertext_with_nonce) >= 4 + 16:
-            try:
-                nonce_bytes = ciphertext_with_nonce[:4]
-                ciphertext = ciphertext_with_nonce[4:]
-                received_nonce = int.from_bytes(nonce_bytes, byteorder='big')
-                
-                if self._is_valid_nonce(received_nonce):
-                    nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
-                    cipher = ChaCha20Poly1305(self.key)
-                    # Try with associated_data first
-                    try:
-                        plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
-                        self._mark_nonce_as_seen(received_nonce)
-                        self._last_decryption_used_prefix = True
-                        print(f"[NOISE-CIPHER] ✓ SUCCESS: 4-byte prefix + hash AD, nonce={received_nonce}")
-                        return plaintext
-                    except Exception as ex:
-                        attempts.append(f"prefix+AD: {type(ex).__name__}")
-                    # Fallback: try with empty AD
-                    try:
-                        plaintext = cipher.decrypt(nonce, ciphertext, b'')
-                        self._mark_nonce_as_seen(received_nonce)
-                        self._last_decryption_used_prefix = True
-                        print(f"[NOISE-CIPHER] ✓ SUCCESS: 4-byte prefix + empty AD, nonce={received_nonce}")
-                        return plaintext
-                    except Exception as ex:
-                        attempts.append(f"prefix+empty: {type(ex).__name__}")
-            except Exception as ex:
-                attempts.append(f"prefix-parse: {type(ex).__name__}")
+        if not self._is_valid_nonce(received_nonce):
+            raise NoiseError(f"Invalid or replayed nonce: {received_nonce}")
         
-        # For long blocks: also try no-prefix as fallback with other nonces
-        if not is_short_block and len(ciphertext_with_nonce) >= 16:
-            for candidate_nonce in [0, 1, 2]:
-                try:
-                    nonce = b'\x00\x00\x00\x00' + candidate_nonce.to_bytes(8, byteorder='little')
-                    cipher = ChaCha20Poly1305(self.key)
-                    plaintext = cipher.decrypt(nonce, ciphertext_with_nonce, associated_data)
-                    self._mark_nonce_as_seen(candidate_nonce)
-                    self._last_decryption_used_prefix = False
-                    print(f"[NOISE-CIPHER] ✓ SUCCESS (long, fallback): no prefix, nonce={candidate_nonce}, hash AD")
-                    return plaintext
-                except Exception as ex:
-                    attempts.append(f"LONG:no-prefix,n={candidate_nonce},AD: {type(ex).__name__}")
-
-        # All attempts failed
-        error_summary = " | ".join(attempts)
-        print(f"[NOISE-CIPHER] ✗ FAILED all {len(attempts)} attempts: {error_summary}")
-        raise NoiseError(f"Decryption failed (all {len(attempts)} attempts): {error_summary}")
+        # Build 12-byte ChaCha20 nonce: [4 zero bytes][8-byte LE counter]
+        nonce = b'\x00\x00\x00\x00' + received_nonce.to_bytes(8, byteorder='little')
+        cipher = ChaCha20Poly1305(self.key)
+        plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
+        self._mark_nonce_as_seen(received_nonce)
+        return plaintext
     
     def _is_valid_nonce(self, nonce: int) -> bool:
         """Check if nonce is within acceptable window (replay protection)"""
