@@ -16,7 +16,7 @@ A Python implementation of the BitChat decentralized, peer-to-peer, encrypted ch
 
 
 
-## Usage
+## Usage 
 
 ### Simple start
 ```Shell
