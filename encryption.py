@@ -174,19 +174,13 @@ class NoiseHandshakeState:
     def _decrypt_and_hash(self, ciphertext_bytes: bytes) -> bytes:
         """Decrypt ciphertext and mix it into hash (handshake mode - NO nonce prefix).
         
-        CRITICAL: Android behavior - Save hash BEFORE mixing, use saved hash as AD.
-        This matches Android's SymmetricState.decryptAndHash():
-        1. Save current hash h to prev_h
-        2. Mix ciphertext into hash (updates h)
-        3. Decrypt using prev_h (old hash) as associated data
+        Standard Noise behavior: Decrypt using current hash as AD, then mix ciphertext.
         """
         if self.cipher_state.has_key():
-            # Save hash state BEFORE mixing (matches Android prev_h behavior)
-            hash_before_mix = self.hash_state
-            # Mix ciphertext into hash (updates hash_state)
+            # Decrypt using current hash as associated data
+            plaintext = self.cipher_state.decrypt_handshake(ciphertext_bytes, self.hash_state)
+            # After successful decryption, mix the ciphertext into hash
             self._mix_hash(ciphertext_bytes)
-            # Decrypt using the OLD hash (before mixing) as associated data
-            plaintext = self.cipher_state.decrypt_handshake(ciphertext_bytes, hash_before_mix)
             return plaintext
         else:
             self._mix_hash(ciphertext_bytes)
