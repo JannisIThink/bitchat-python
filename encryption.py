@@ -268,9 +268,10 @@ class NoiseHandshakeState:
                     shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                 self._mix_key(shared)
         
-        # Encrypt payload
-        encrypted_payload = self._encrypt_and_hash(payload)
-        message_buffer.extend(encrypted_payload)
+        # Encrypt payload (only if non-empty)
+        if payload:
+            encrypted_payload = self._encrypt_and_hash(payload)
+            message_buffer.extend(encrypted_payload)
         
         self.current_pattern += 1
         return bytes(message_buffer)
@@ -378,8 +379,11 @@ class NoiseHandshakeState:
                         shared = self._dh(self.local_ephemeral_private, self.remote_static_public, 'se')
                     self._mix_key(shared)
         
-        # Decrypt payload
-        payload = self._decrypt_and_hash(buffer)
+        # Decrypt payload (only if remainder exists)
+        if buffer:
+            payload = self._decrypt_and_hash(buffer)
+        else:
+            payload = b''
         self.current_pattern += 1
         
         return payload
