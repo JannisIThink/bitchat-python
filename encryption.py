@@ -83,7 +83,12 @@ class NoiseHandshakeState:
         print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
     
     def _mix_key(self, input_key_material: bytes):
-        """Mix key material into chaining key and update cipher - uses 2-output HKDF per Noise spec"""
+        """Mix key material into chaining key and update cipher (Noise mixKey).
+
+        IMPORTANT: mixKey does NOT update the handshake hash. It only updates
+        chaining key and cipher key. This must match Noise reference behavior
+        (Android/iOS).
+        """
         print(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
         print(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
 
@@ -109,14 +114,13 @@ class NoiseHandshakeState:
         print(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
 
         # Per OFFICIAL Noise spec: output1 becomes chaining key, output2 becomes cipher key
-        # We mix output2 into the hash AFTER setting the cipher key
+        # NOTE: mixKey does NOT mix output2 into the hash
         self.chaining_key = output1
         
-        # Save hash state BEFORE mixing (for fallback if peer doesn't mix output2)
+        # Save current hash state for optional compatibility fallback
         self.hash_state_before_mix = self.hash_state
         
         self.cipher_state.initialize_key(output2)
-        self._mix_hash(output2)
     
     def _mix_hash(self, data: bytes):
         """Mix data into handshake hash"""
@@ -603,16 +607,18 @@ class NoiseCipherState:
     def encrypt_handshake(self, plaintext: bytes, associated_data: bytes = b'') -> bytes:
         """Encrypt plaintext during HANDSHAKE phase (NO 4-byte nonce prefix).
         
-        During Noise handshake, the protocol uses nonce=0 but DOES NOT add the 4-byte
-        extracted nonce prefix. The output is simply: [encrypted data][16-byte MAC]
-        
-        This matches the Android implementation which uses cipher.encryptWithAd() directly.
+        During Noise handshake, the protocol uses the cipher state's nonce
+        counter starting at 0 and increments per encrypt/decrypt, but does NOT
+        add the 4-byte extracted nonce prefix. Output is:
+        [encrypted data][16-byte MAC].
         """
         if not self.has_key():
             raise NoiseError("Cipher not initialized for handshake")
         
-        # Handshake always uses nonce=0 (it does not increment during handshake)
-        nonce = b'\x00\x00\x00\x00' + b'\x00' * 8  # 12-byte zero nonce
+        # Use and increment handshake nonce counter (Noise spec)
+        nonce_value = self.nonce
+        self.nonce += 1
+        nonce = b'\x00\x00\x00\x00' + nonce_value.to_bytes(8, byteorder='little')
         
         cipher = ChaCha20Poly1305(self.key)
         ciphertext = cipher.encrypt(nonce, plaintext, associated_data)
@@ -624,16 +630,18 @@ class NoiseCipherState:
     def decrypt_handshake(self, ciphertext: bytes, associated_data: bytes = b'') -> bytes:
         """Decrypt ciphertext during HANDSHAKE phase (NO 4-byte nonce prefix extraction).
         
-        During Noise handshake, the protocol uses nonce=0 and does NOT add the 4-byte
-        extracted nonce prefix. The input is simply: [encrypted data][16-byte MAC]
-        
-        This matches the Android implementation which uses cipher.encryptWithAd() directly.
+        During Noise handshake, the protocol uses the cipher state's nonce
+        counter starting at 0 and increments per encrypt/decrypt, but does NOT
+        add the 4-byte extracted nonce prefix. Input is:
+        [encrypted data][16-byte MAC].
         """
         if not self.has_key():
             raise NoiseError("Cipher not initialized for handshake")
         
-        # Handshake always uses nonce=0 (it does not increment during handshake)
-        nonce = b'\x00\x00\x00\x00' + b'\x00' * 8  # 12-byte zero nonce
+        # Use and increment handshake nonce counter (Noise spec)
+        nonce_value = self.nonce
+        self.nonce += 1
+        nonce = b'\x00\x00\x00\x00' + nonce_value.to_bytes(8, byteorder='little')
         
         cipher = ChaCha20Poly1305(self.key)
         plaintext = cipher.decrypt(nonce, ciphertext, associated_data)
