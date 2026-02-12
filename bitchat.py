@@ -245,6 +245,16 @@ class BitchatClient:
         # Pending private messages waiting for handshake completion
         self.pending_private_messages: Dict[str, List[Tuple[str, str, str]]] = {}  # peer_id -> [(content, nickname, message_id)]
 
+        # Packet-level dedup for relay (matching Android SecurityManager)
+        # Key: "timestamp-senderID-payloadHash", auto-cleanup after 5 minutes
+        self._relayed_packets: Dict[str, float] = {}
+        self._relay_dedup_ttl = 300  # 5 minutes
+
+        # Callback invoked with raw relay bytes before each relay send.
+        # Signature: on_relay(data: bytes) -> None
+        # Does NOT affect relay behaviour – purely informational.
+        self.on_relay: Optional[callable] = None
+
         # Setup encryption service callbacks for better handshake handling
         self.encryption_service.on_peer_authenticated = self._on_peer_authenticated
         self.encryption_service.on_handshake_required = self._on_handshake_required
@@ -728,22 +738,63 @@ class BitchatClient:
                 # Silently ignore blocking errors
                 pass
 
+    def _make_packet_dedup_key(self, packet: BitchatPacket) -> str:
+        """Create a dedup key for a packet (matching Android SecurityManager).
+        Key = timestamp-senderIDhex-payloadSHA256hex[:16]"""
+        payload_hash = hashlib.sha256(bytes(packet.payload)).hexdigest()[:16]
+        return f"{packet.timestamp}-{packet.sender_id_str}-{payload_hash}"
+
+    def _is_packet_seen(self, packet: BitchatPacket) -> bool:
+        """Check if this packet was already processed (relay dedup)."""
+        key = self._make_packet_dedup_key(packet)
+        now = time.time()
+        # Periodic cleanup
+        if len(self._relayed_packets) > 500:
+            stale = [k for k, ts in self._relayed_packets.items() if now - ts > self._relay_dedup_ttl]
+            for k in stale:
+                del self._relayed_packets[k]
+        if key in self._relayed_packets:
+            return True
+        self._relayed_packets[key] = now
+        return False
+
+    async def _relay_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay: bool = False):
+        """Relay a packet if TTL > 1 (shared relay logic for all packet types)."""
+        if packet.ttl <= 1:
+            return
+        await asyncio.sleep(random.uniform(0.01, 0.05))
+        relay_data = bytearray(raw_data)
+        relay_data[2] = packet.ttl - 1
+        relay_bytes = bytes(relay_data)
+        # Invoke relay callback (informational, does not block relay)
+        if self.on_relay is not None:
+            try:
+                self.on_relay(relay_bytes)
+            except Exception:
+                pass
+        await self.send_packet(relay_bytes)
+        if self.toLoRa is not None and not noRelay:
+            self.toLoRa: multiprocessing.Queue
+            self.toLoRa.put(relay_bytes)
+
     async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle incoming packet"""
         if packet.msg_type == MessageType.ANNOUNCE:
-            await self.handle_announce(packet)
+            await self.handle_announce(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.MESSAGE:
             await self.handle_message(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.FRAGMENT:
             await self.handle_fragment(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.NOISE_HANDSHAKE:
-            await self.handle_noise_handshake(packet)
+            await self.handle_noise_handshake(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.NOISE_ENCRYPTED:
-            await self.handle_noise_encrypted(packet, raw_data)
+            await self.handle_noise_encrypted(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.LEAVE:
-            await self.handle_leave(packet)
+            await self.handle_leave(packet, raw_data, noRelay)
+        elif packet.msg_type == MessageType.REQUEST_SYNC:
+            await self._relay_packet(packet, raw_data, noRelay)
 
-    async def handle_announce(self, packet: BitchatPacket):
+    async def handle_announce(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
         """Handle peer announcement"""
         peer_nickname = None
         
@@ -842,6 +893,9 @@ class BitchatClient:
                 except Exception as e:
                     debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
 
+        # Relay ANNOUNCE if TTL > 1 (matching Android PacketRelayManager)
+        await self._relay_packet(packet, raw_data, noRelay)
+
     async def handle_message(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle chat message"""
         # Check if sender is blocked
@@ -856,15 +910,7 @@ class BitchatClient:
 
         if not is_for_us:
             # Relay if TTL > 1
-            if packet.ttl > 1:
-                await asyncio.sleep(random.uniform(0.01, 0.05))
-                relay_data = bytearray(raw_data)
-                relay_data[2] = packet.ttl - 1
-                await self.send_packet(bytes(relay_data))
-                if (self.toLoRa != None) and (not noRelay):
-                    self.toLoRa : multiprocessing.Queue
-                    print("Sent:",parse_bitchat_packet(relay_data))
-                    self.toLoRa.put(bytes(relay_data))
+            await self._relay_packet(packet, raw_data, noRelay)
             return
         is_private_message = not is_broadcast and is_for_us
         decrypted_payload = None
@@ -917,15 +963,7 @@ class BitchatClient:
                     await self.send_delivery_ack(message.id, packet.sender_id_str, is_private_message)
 
                 # Relay if TTL > 1
-                if packet.ttl > 1:
-                    await asyncio.sleep(random.uniform(0.01, 0.05))
-                    relay_data = bytearray(raw_data)
-                    relay_data[2] = packet.ttl - 1
-                    await self.send_packet(bytes(relay_data))
-                    if (self.toLoRa != None) and (not noRelay):
-                        self.toLoRa : multiprocessing.Queue
-                        print("Sent",parse_bitchat_packet(relay_data))
-                        self.toLoRa.put(bytes(relay_data))
+                await self._relay_packet(packet, raw_data, noRelay)
             else:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
 
@@ -1019,17 +1057,9 @@ class BitchatClient:
             debug_println(f"[FRAG] Fragment payload too short: {len(packet.payload)} bytes (need >= 13)")
 
         # Relay fragment if TTL > 1
-        if packet.ttl > 1:
-            await asyncio.sleep(random.uniform(0.01, 0.05))
-            relay_data = bytearray(raw_data)
-            relay_data[2] = packet.ttl - 1
-            await self.send_packet(bytes(relay_data))
-            if (self.toLoRa != None) and (not noRelay):
-                    self.toLoRa : multiprocessing.Queue
-                    print("Sent",parse_bitchat_packet(relay_data))
-                    self.toLoRa.put(bytes(relay_data))
+        await self._relay_packet(packet, raw_data, noRelay)
 
-    async def handle_noise_handshake(self, packet: BitchatPacket):
+    async def handle_noise_handshake(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
         """Handle Noise handshake (combined handler for both init and response)"""
         debug_println(f"[NOISE] Received handshake from {packet.sender_id_str}")
         debug_println(f"[NOISE] Recipient ID: {packet.recipient_id_str}, My ID: {self.my_peer_id}")
@@ -1209,10 +1239,17 @@ class BitchatClient:
             # Clear any partial handshake state
             self.encryption_service.clear_handshake_state(packet.sender_id_str)
 
-    async def handle_noise_encrypted(self, packet: BitchatPacket, raw_data: bytes):
+    async def handle_noise_encrypted(self, packet: BitchatPacket, raw_data: bytes, noRelay: bool = False):
         """Handle Noise encrypted message"""
         debug_println(f"[NOISE] Received encrypted message from {packet.sender_id_str}")
         debug_full_println(f"[DIAG] handle_noise_encrypted called: sender={packet.sender_id_str[:8]}, payload={len(packet.payload)} bytes")
+
+        # Relay encrypted messages not addressed to us (matching Android PacketRelayManager)
+        is_for_us = (not packet.recipient_id_str) or (packet.recipient_id_str == self.my_peer_id)
+        if not is_for_us:
+            debug_println(f"[NOISE] Encrypted message not for us, relaying")
+            await self._relay_packet(packet, raw_data, noRelay)
+            return
 
         # Check if sender is blocked
         fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
@@ -1222,13 +1259,7 @@ class BitchatClient:
 
         # Check if we have a session with this peer
         has_session = self.encryption_service.is_session_established(packet.sender_id_str)
-        print(f"[DIAG] Session with {packet.sender_id_str[:8]}: {'YES' if has_session else 'NO'}")
-
-        # Check if sender is blocked
-        fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
-        if fingerprint and fingerprint in self.blocked_peers:
-            debug_println(f"[BLOCKED] Ignoring encrypted message from blocked peer: {packet.sender_id_str}")
-            return
+        debug_println(f"[DIAG] Session with {packet.sender_id_str[:8]}: {'YES' if has_session else 'NO'}")
 
         try:
             # Convert bytearray to bytes for encryption service
@@ -1337,7 +1368,7 @@ class BitchatClient:
                     # Don't reset the session here, just log it
                     # The nonce is already incremented by the failed decrypt attempt
 
-    async def handle_leave(self, packet: BitchatPacket):
+    async def handle_leave(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
         """Handle leave notification"""
         payload_str = packet.payload.decode('utf-8', errors='ignore').strip()
 
@@ -1380,6 +1411,9 @@ class BitchatClient:
             # If this was the last peer, we might be alone now
             if len(self.peers) == 0:
                 print("\033[90m» You're now the only one in the network.\033[0m\n> ", end='', flush=True)
+
+        # Relay LEAVE if TTL > 1 (matching Android PacketRelayManager)
+        await self._relay_packet(packet, raw_data, noRelay)
 
     async def handle_channel_announce(self, packet: BitchatPacket):
         """Handle channel announcement"""
@@ -1442,13 +1476,7 @@ class BitchatClient:
 
         elif packet.ttl > 1:
             # Relay ACK
-            relay_data = bytearray(raw_data)
-            relay_data[2] = packet.ttl - 1
-            await self.send_packet(bytes(relay_data))
-            if (self.toLoRa != None) and (not noRelay):
-                self.toLoRa : multiprocessing.Queue
-                print("Sent",parse_bitchat_packet(relay_data))
-                self.toLoRa.put(bytes(relay_data))
+            await self._relay_packet(packet, raw_data, noRelay)
 
     async def handle_noise_identity_announce(self, packet: BitchatPacket):
         """Handle Noise identity announcement"""
