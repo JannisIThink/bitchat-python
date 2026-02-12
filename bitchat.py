@@ -1784,45 +1784,30 @@ class BitchatClient:
                                                   signing_public_key: bytes, nickname: str, 
                                                   timestamp: int, signature: bytes, 
                                                   previous_peer_id: str = None) -> bytes:
-        """Encode noise identity announcement to binary format matching iOS appendData format"""
+        """Encode noise identity announcement to TLV binary format matching Android/iOS.
+        
+        TLV format (from Android IdentityAnnouncement):
+          0x01 [len] [nickname_utf8]
+          0x02 [len] [noise_public_key]  (X25519, 32 bytes)
+          0x03 [len] [signing_public_key] (Ed25519, 32 bytes)
+        """
         data = bytearray()
 
-        # Flags byte: bit 0 = hasPreviousPeerID
-        flags = 0
-        if previous_peer_id:
-            flags |= 0x01
-        data.append(flags)
-
-        # PeerID as 8-byte hex string (match Swift conversion)
-        peer_data = bytes.fromhex(peer_id.ljust(16, '0')[:16])  # Pad to 8 bytes
-        data.extend(peer_data)
-
-        # PublicKey using appendData format (1-byte length prefix since 32 < 255)
-        data.append(len(public_key))
-        data.extend(public_key)
-
-        # SigningPublicKey using appendData format (1-byte length prefix since 32 < 255)
-        data.append(len(signing_public_key))
-        data.extend(signing_public_key)
-
-        # Nickname using appendString format (1-byte length prefix for strings under 255 chars)
+        # TLV 0x01: Nickname
         nickname_bytes = nickname.encode('utf-8')
+        data.append(0x01)
         data.append(len(nickname_bytes))
         data.extend(nickname_bytes)
 
-        # Timestamp using appendDate format (8 bytes UInt64 milliseconds, big-endian)
-        timestamp_ms = int(timestamp * 1000)  # Convert to milliseconds
-        for i in range(8):
-            data.append((timestamp_ms >> ((7-i) * 8)) & 0xFF)
+        # TLV 0x02: Noise public key (X25519)
+        data.append(0x02)
+        data.append(len(public_key))
+        data.extend(public_key)
 
-        # PreviousPeerID if present (8 bytes, after timestamp)
-        if previous_peer_id:
-            prev_data = bytes.fromhex(previous_peer_id.ljust(16, '0')[:16])  # Pad to 8 bytes
-            data.extend(prev_data)
-
-        # Signature using appendData format (1-byte length prefix)
-        data.append(len(signature))
-        data.extend(signature)
+        # TLV 0x03: Signing public key (Ed25519)
+        data.append(0x03)
+        data.append(len(signing_public_key))
+        data.extend(signing_public_key)
 
         return bytes(data)
 
