@@ -633,12 +633,19 @@ class BitchatClient:
             pass
 
         try:
-            # Remove PKCS#7 padding before parsing (matching iOS implementation)
-            unpadded_data = unpad_packet(data)
-            packet = parse_bitchat_packet(unpadded_data)
+            # Log raw packet type byte for diagnostics (byte at offset 1 is msg_type)
+            if len(data) >= 2:
+                raw_type = data[1]
+                print(f"[DIAG] Incoming BLE packet: {len(data)} bytes, raw_type=0x{raw_type:02x}")
+
+            # Parse packet using two-pass strategy (matching Android):
+            # 1st pass: try parsing raw data (decoder reads by field position, ignores trailing padding)
+            # 2nd pass: try unpadding with strict PKCS#7 validation, then parse
+            packet = parse_bitchat_packet(data)
 
             if packet is None:
                 debug_full_println(f"[ERROR] Failed to parse packet: decode returned None")
+                print(f"[DIAG] PARSE FAILED: raw_len={len(data)}, first_bytes={data[:16].hex() if len(data) >= 16 else data.hex()}")
                 return
 
             # Ignore our own messages (they are already displayed when sent)
@@ -650,6 +657,7 @@ class BitchatClient:
         except Exception as e:
             try:
                 debug_full_println(f"[ERROR] Failed to parse packet: {e}")
+                print(f"[DIAG] EXCEPTION in notification_handler: {type(e).__name__}: {e}")
             except BlockingIOError:
                 # Silently ignore blocking errors
                 pass
@@ -1106,6 +1114,17 @@ class BitchatClient:
     async def handle_noise_encrypted(self, packet: BitchatPacket, raw_data: bytes):
         """Handle Noise encrypted message"""
         debug_println(f"[NOISE] Received encrypted message from {packet.sender_id_str}")
+        print(f"[DIAG] handle_noise_encrypted called: sender={packet.sender_id_str[:8]}, payload={len(packet.payload)} bytes")
+
+        # Check if sender is blocked
+        fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
+        if fingerprint and fingerprint in self.blocked_peers:
+            debug_println(f"[BLOCKED] Ignoring encrypted message from blocked peer: {packet.sender_id_str}")
+            return
+
+        # Check if we have a session with this peer
+        has_session = self.encryption_service.is_session_established(packet.sender_id_str)
+        print(f"[DIAG] Session with {packet.sender_id_str[:8]}: {'YES' if has_session else 'NO'}")
 
         # Check if sender is blocked
         fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
@@ -1120,6 +1139,7 @@ class BitchatClient:
             # Decrypt the Noise encrypted payload
             decrypted_payload = self.encryption_service.decrypt_from_peer(packet.sender_id_str, payload_bytes)
             debug_println(f"[NOISE] Successfully decrypted {len(decrypted_payload)} bytes from {packet.sender_id_str}")
+            print(f"[DIAG] Decryption SUCCESS: {len(decrypted_payload)} bytes, hex={decrypted_payload[:20].hex()}")
 
             try:
                 # Parse as NoisePayload: [type_byte][data]
@@ -1200,6 +1220,7 @@ class BitchatClient:
 
         except Exception as e:
             debug_println(f"[NOISE] Failed to decrypt message from {packet.sender_id_str}: {e}")
+            print(f"[DIAG] DECRYPTION FAILED from {packet.sender_id_str[:8]}: {type(e).__name__}: {e}")
             # Check if we have a session with this peer
             if not self.encryption_service.is_session_established(packet.sender_id_str):
                 debug_println(f"[NOISE] No session established with {packet.sender_id_str}")
@@ -2623,6 +2644,7 @@ class BitchatClient:
             # Encrypt the NoisePayload (matching Android/iOS)
             encrypted = self.encryption_service.encrypt_for_peer(target_peer_id, bytes(noise_payload))
             debug_println(f"[PRIVATE] Encrypted NoisePayload: {len(encrypted)} bytes")
+            print(f"[DIAG] Encrypted message for {target_peer_id[:8]}: {len(encrypted)} bytes (nonce: {encrypted[:4].hex()})")
 
             # Create outer Noise encrypted packet
             packet = create_bitchat_packet_with_recipient(
@@ -2632,10 +2654,12 @@ class BitchatClient:
                 encrypted,
                 None
             )
+            print(f"[DIAG] Created NOISE_ENCRYPTED packet: {len(packet)} bytes, sending...")
 
             # Send with better error handling for BLE issues
             try:
                 await self.send_packet(packet)
+                print(f"[DIAG] NOISE_ENCRYPTED packet sent successfully to {target_peer_id[:8]}")
 
                 # Display sent message
                 timestamp = datetime.now()
@@ -2885,7 +2909,7 @@ def print_banner():
     print("\033[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n")
 
 def unpad_packet(data: bytes) -> bytes:
-    """Remove PKCS#7 padding from packet data (matching iOS implementation)"""
+    """Remove PKCS#7 padding from packet data (strict validation matching Android/iOS)"""
     if len(data) == 0:
         return data
 
@@ -2896,13 +2920,30 @@ def unpad_packet(data: bytes) -> bytes:
     if padding_length <= 0 or padding_length > len(data):
         return data  # No padding or invalid padding
 
-    # Remove the indicated number of bytes
-    result = data[:-padding_length]
+    # Strict PKCS#7 validation: ALL padding bytes must equal padding_length
+    # This matches Android MessagePadding.unpad() exactly
+    start = len(data) - padding_length
+    for i in range(start, len(data)):
+        if data[i] != padding_length:
+            return data  # Invalid PKCS#7, return original data unchanged
+
+    # Remove the validated padding
+    result = data[:start]
     return result
 
 def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
-    """Parse a BitChat packet from raw bytes (compatibility wrapper)"""
-    return BinaryProtocol.decode(data)
+    """Parse a BitChat packet from raw bytes (two-pass decode matching Android)"""
+    # First try: decode as-is (works even with padding because decoder reads by field position)
+    result = BinaryProtocol.decode(data)
+    if result is not None:
+        return result
+    
+    # Second try: unpad and decode (fallback)
+    unpadded = unpad_packet(data)
+    if unpadded != data:  # Only if unpadding actually changed something
+        return BinaryProtocol.decode(unpadded)
+    
+    return None
 
 def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
     """Parse message payload, matching Swift implementation"""
@@ -3029,11 +3070,11 @@ def create_bitchat_packet_with_recipient(sender_id: str, recipient_id: Optional[
     
     padding_needed = target_size - len(encoded)
     
-    # PKCS#7 padding
+    # Proper PKCS#7 padding: ALL bytes must equal the padding length
+    # This matches Android's MessagePadding.pad() exactly
     if 0 < padding_needed <= 255:
-        padding = bytearray(os.urandom(padding_needed - 1))
-        padding.append(padding_needed)
-        encoded = encoded + bytes(padding)
+        padding = bytes([padding_needed] * padding_needed)
+        encoded = encoded + padding
     
     # Add hex logging to match iOS format
     hex_string = ' '.join(f'{b:02X}' for b in encoded)
