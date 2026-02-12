@@ -24,7 +24,7 @@ from pybloom_live import BloomFilter
 
 from encryption import EncryptionService, NoiseError
 from compression import compress_if_beneficial, decompress
-from fragmentation import Fragment, FragmentType, fragment_payload
+from fragmentation import FragmentPayload, create_fragments, FRAGMENT_SIZE_THRESHOLD
 from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
@@ -148,13 +148,19 @@ class DeliveryTracker:
         return True
 
 class FragmentCollector:
+    FRAGMENT_TIMEOUT = 30  # seconds, matching Android FragmentManager
+
     def __init__(self):
         self.fragments: Dict[str, Dict[int, bytes]] = {}
         self.metadata: Dict[str, Tuple[int, int, str]] = {}
+        self.timestamps: Dict[str, float] = {}  # track when first fragment arrived
 
     def add_fragment(self, fragment_id: bytes, index: int, total: int, 
                     original_type: int, data: bytes, sender_id: str) -> Optional[Tuple[bytes, str]]:
         fragment_id_hex = fragment_id.hex()
+
+        # Clean up stale fragments before adding new ones (matching Android's periodic cleanup)
+        self._cleanup_stale_fragments()
 
         debug_full_println(f"[COLLECTOR] Adding fragment {index + 1}/{total} for ID {fragment_id_hex[:8]}")
 
@@ -162,6 +168,7 @@ class FragmentCollector:
             debug_full_println(f"[COLLECTOR] Creating new fragment collection for ID {fragment_id_hex[:8]}")
             self.fragments[fragment_id_hex] = {}
             self.metadata[fragment_id_hex] = (total, original_type, sender_id)
+            self.timestamps[fragment_id_hex] = time.time()
 
         fragment_map = self.fragments[fragment_id_hex]
         fragment_map[index] = data
@@ -185,10 +192,25 @@ class FragmentCollector:
 
             del self.fragments[fragment_id_hex]
             del self.metadata[fragment_id_hex]
+            if fragment_id_hex in self.timestamps:
+                del self.timestamps[fragment_id_hex]
 
             return (bytes(complete_data), sender)
 
         return None
+
+    def _cleanup_stale_fragments(self):
+        """Remove fragment collections older than FRAGMENT_TIMEOUT (matching Android FragmentManager)"""
+        now = time.time()
+        stale_ids = [
+            fid for fid, ts in self.timestamps.items()
+            if now - ts > self.FRAGMENT_TIMEOUT
+        ]
+        for fid in stale_ids:
+            debug_println(f"[COLLECTOR] Removing stale fragment collection {fid[:8]} (timed out after {self.FRAGMENT_TIMEOUT}s)")
+            self.fragments.pop(fid, None)
+            self.metadata.pop(fid, None)
+            self.timestamps.pop(fid, None)
 
 class BitchatClient:
     def __init__(self,fromLoRa = None,toLoRa = None):
@@ -561,7 +583,7 @@ class BitchatClient:
                     raise e
 
     async def send_packet_with_fragmentation(self, packet: bytes):
-        """Fragment and send large packets"""
+        """Fragment and send large packets (matching Android FragmentManager.createFragments)"""
         if not self.client or not self.characteristic:
             debug_println("[!] No connection available. Cannot send fragmented message.")
             return
@@ -575,8 +597,25 @@ class BitchatClient:
 
         debug_println(f"[FRAG] Original packet size: {len(packet)} bytes")
 
-        fragment_size = 150  # Conservative size for iOS BLE
-        chunks = [packet[i:i+fragment_size] for i in range(0, len(packet), fragment_size)]
+        # Android: unpad the encoded packet before fragmenting
+        unpadded_packet = unpad_packet(packet)
+        debug_println(f"[FRAG] Unpadded packet size: {len(unpadded_packet)} bytes")
+
+        # Parse original packet to extract original type, recipient, route
+        original_parsed = parse_bitchat_packet(packet)
+        if original_parsed:
+            original_type = original_parsed.msg_type.value
+            original_recipient = original_parsed.recipient_id
+            original_route = original_parsed.route
+        else:
+            original_type = MessageType.MESSAGE.value
+            original_recipient = None
+            original_route = None
+
+        # Android uses dynamic fragment size: 512 - (headerSize + senderSize + recipientSize + routeSize + fragmentHeaderSize + paddingBuffer)
+        # Default MAX_FRAGMENT_SIZE from AppConstants = 469
+        fragment_size = 469
+        chunks = [unpadded_packet[i:i+fragment_size] for i in range(0, len(unpadded_packet), fragment_size)]
         total_fragments = len(chunks)
 
         fragment_id = os.urandom(8)
@@ -584,26 +623,35 @@ class BitchatClient:
         debug_println(f"[FRAG] Total fragments: {total_fragments}")
 
         for index, chunk in enumerate(chunks):
-            if index == 0:
-                fragment_type = MessageType.FRAGMENT
-            elif index == len(chunks) - 1:
-                fragment_type = MessageType.FRAGMENT
+            # Create fragment payload: [8B fragmentID][2B index BE][2B total BE][1B originalType][data]
+            frag_payload = bytearray()
+            frag_payload.extend(fragment_id)
+            frag_payload.extend(struct.pack('>H', index))
+            frag_payload.extend(struct.pack('>H', total_fragments))
+            frag_payload.append(original_type)
+            frag_payload.extend(chunk)
+
+            # Android: fragment packet inherits sender, recipient, route from original
+            if original_recipient:
+                recipient_hex = original_recipient.hex() if isinstance(original_recipient, bytes) else original_recipient
+                fragment_packet_obj = BitchatPacket(
+                    version=PROTOCOL_VERSION,
+                    msg_type=MessageType.FRAGMENT,
+                    ttl=7,
+                    timestamp=int(time.time() * 1000),
+                    sender_id=bytes.fromhex(self.my_peer_id) if len(self.my_peer_id) == 16 else bytes.fromhex(self.my_peer_id.ljust(16, '0')),
+                    payload=bytes(frag_payload),
+                    recipient_id=original_recipient,
+                    route=original_route,
+                )
+                fragment_packet = BinaryProtocol.encode(fragment_packet_obj)
+                fragment_packet = pad_to_optimal_block_size(fragment_packet)
             else:
-                fragment_type = MessageType.FRAGMENT
-
-            # Create fragment payload
-            fragment_payload = bytearray()
-            fragment_payload.extend(fragment_id)
-            fragment_payload.extend(struct.pack('>H', index))
-            fragment_payload.extend(struct.pack('>H', total_fragments))
-            fragment_payload.append(MessageType.MESSAGE.value)
-            fragment_payload.extend(chunk)
-
-            fragment_packet = create_bitchat_packet(
-                self.my_peer_id,
-                fragment_type,
-                bytes(fragment_payload)
-            )
+                fragment_packet = create_bitchat_packet(
+                    self.my_peer_id,
+                    MessageType.FRAGMENT,
+                    bytes(frag_payload)
+                )
 
             try:
                 await self.client.write_gatt_char(
@@ -3265,8 +3313,8 @@ def create_encrypted_channel_message_payload(sender: str, content: str, channel:
     return create_bitchat_message_payload_full(sender, content, channel, False, sender_peer_id, True, encrypted_content)
 
 def should_fragment(packet: bytes) -> bool:
-    """Check if packet needs fragmentation"""
-    return len(packet) > 500
+    """Check if packet needs fragmentation (matching Android FRAGMENT_SIZE_THRESHOLD = 512)"""
+    return len(packet) > 512
 
 def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional[List[str]],
                    my_nickname: str, active_peer_count: int) -> bool:
