@@ -445,11 +445,14 @@ class BitchatClient:
                     self.nickname, timestamp_ms, signature
                 )
 
-                identity_packet = create_bitchat_packet_with_signature(
-                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload, signature
+                # Create packet WITHOUT packet-level signature first, then sign with Ed25519
+                identity_packet = create_bitchat_packet(
+                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload
                 )
+                # Sign with Ed25519 (Android verifies ANNOUNCE packets with Ed25519)
+                identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                 await self.send_packet(identity_packet)
-                debug_println("[3] Sent Noise identity announcement (binary format)")
+                debug_println("[3] Sent Noise identity announcement (Ed25519 signed)")
             except Exception as e:
                 debug_println(f"[3] Failed to send identity announcement: {e}")
                 import traceback
@@ -464,10 +467,11 @@ class BitchatClient:
             # Wait a bit between packets
             await asyncio.sleep(0.5)
 
-            # Send announce
+            # Send announce (also signed for Android compatibility)
             announce_packet = create_bitchat_packet(
                 self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
             )
+            announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
             await self.send_packet(announce_packet)
 
             debug_println("[3] Handshake sent. You can now chat.")
@@ -770,8 +774,9 @@ class BitchatClient:
 
                     identity_packet = create_bitchat_packet_with_recipient(
                         self.my_peer_id, packet.sender_id_str, MessageType.ANNOUNCE, 
-                        identity_payload, signature
+                        identity_payload, None
                     )
+                    identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                     await self.send_packet(identity_packet)
                 except Exception as e:
                     debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
@@ -1965,6 +1970,7 @@ class BitchatClient:
                 announce_packet = create_bitchat_packet(
                     self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                 )
+                announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
                 await self.send_packet(announce_packet)
                 print(f"\033[90m» Nickname changed to: {self.nickname}\033[0m")
                 await self.save_app_state()
@@ -2561,6 +2567,9 @@ class BitchatClient:
             self.my_peer_id, MessageType.MESSAGE, payload
         )
 
+        # Sign with Ed25519 before sending (Android requires signature for MESSAGE packets)
+        message_packet = sign_outgoing_packet(message_packet, self.encryption_service)
+
         await self.send_packet(message_packet)
 
         # Display sent message
@@ -2796,9 +2805,10 @@ class BitchatClient:
                                     self.nickname, timestamp_ms, signature
                                 )
 
-                                identity_packet = create_bitchat_packet_with_signature(
-                                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload, signature
+                                identity_packet = create_bitchat_packet(
+                                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload
                                 )
+                                identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                                 await self.send_packet(identity_packet)
                             except Exception as e:
                                 debug_println(f"[SCANNER] Failed to send identity: {e}")
@@ -2814,6 +2824,7 @@ class BitchatClient:
                             announce_packet = create_bitchat_packet(
                                 self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                             )
+                            announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
                             await self.send_packet(announce_packet)
 
                             print("> ", end='', flush=True)
@@ -2951,6 +2962,77 @@ def unpad_packet(data: bytes) -> bytes:
     result = data[:start]
     return result
 
+def pad_to_optimal_block_size(data: bytes) -> bytes:
+    """Pad data to optimal block size matching Android's MessagePadding exactly.
+    Android: optimalBlockSize adds +16 for encryption overhead before comparing to block sizes.
+    Then PKCS#7 pad if paddingNeeded <= 255.
+    """
+    block_sizes = [256, 512, 1024, 2048]
+    total_size = len(data) + 16  # Match Android's encryption overhead adjustment
+    target_size = len(data)  # Default: no padding for very large packets
+    for bs in block_sizes:
+        if total_size <= bs:
+            target_size = bs
+            break
+    padding_needed = target_size - len(data)
+    if 0 < padding_needed <= 255:
+        return data + bytes([padding_needed] * padding_needed)
+    return data
+
+def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
+    """Sign an encoded+padded packet with Ed25519, matching Android's signPacketBeforeBroadcast.
+    
+    Android signing process:
+    1. Create signing version: TTL=0, signature=null
+    2. Encode with BinaryProtocol.encode (includes padding)
+    3. Sign the encoded bytes with Ed25519
+    4. Add 64-byte signature to packet
+    5. Re-encode final packet with signature
+    """
+    # Decode the packet
+    unpadded = unpad_packet(packet_bytes)
+    packet = BinaryProtocol.decode(unpadded)
+    if packet is None:
+        packet = BinaryProtocol.decode(packet_bytes)
+    if packet is None:
+        return packet_bytes  # Can't decode, return as-is
+    
+    # Create signing data (TTL=0, no signature) - matches Android toBinaryDataForSigning()
+    signing_packet = BitchatPacket(
+        version=packet.version,
+        msg_type=packet.msg_type,
+        ttl=0,  # Fixed TTL=0 for signing (Android: SYNC_TTL_HOPS = 0)
+        timestamp=packet.timestamp,
+        sender_id=packet.sender_id,
+        payload=packet.payload,
+        recipient_id=packet.recipient_id,
+        signature=None,
+        route=packet.route
+    )
+    signing_encoded = BinaryProtocol.encode(signing_packet)
+    signing_padded = pad_to_optimal_block_size(signing_encoded)
+    
+    # Sign with Ed25519 (produces 64-byte signature)
+    ed25519_signature = encryption_service.sign_data(signing_padded)
+    
+    # Create final packet with signature
+    signed_packet = BitchatPacket(
+        version=packet.version,
+        msg_type=packet.msg_type,
+        ttl=packet.ttl,
+        timestamp=packet.timestamp,
+        sender_id=packet.sender_id,
+        payload=packet.payload,
+        recipient_id=packet.recipient_id,
+        signature=ed25519_signature,
+        route=packet.route
+    )
+    final_encoded = BinaryProtocol.encode(signed_packet)
+    final_padded = pad_to_optimal_block_size(final_encoded)
+    
+    debug_full_println(f"[SIGN] Signed packet type={packet.msg_type.name}, sig={ed25519_signature[:8].hex()}...")
+    return final_padded
+
 def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
     """Parse a BitChat packet from raw bytes (two-pass decode matching Android)"""
     # First try: decode as-is (works even with padding because decoder reads by field position)
@@ -3074,27 +3156,8 @@ def create_bitchat_packet_with_recipient(sender_id: str, recipient_id: Optional[
     # Encode packet
     encoded = BinaryProtocol.encode(packet)
     
-    # Add iOS-style padding to standard block sizes for traffic analysis resistance
-    block_sizes = [256, 512, 1024, 2048]
-    total_size = len(encoded)
-    
-    # Find smallest block that fits
-    target_size = None
-    for block_size in block_sizes:
-        if total_size <= block_size:
-            target_size = block_size
-            break
-    
-    if target_size is None:
-        target_size = total_size
-    
-    padding_needed = target_size - len(encoded)
-    
-    # Proper PKCS#7 padding: ALL bytes must equal the padding length
-    # This matches Android's MessagePadding.pad() exactly
-    if 0 < padding_needed <= 255:
-        padding = bytes([padding_needed] * padding_needed)
-        encoded = encoded + padding
+    # Pad to optimal block size matching Android's MessagePadding exactly
+    encoded = pad_to_optimal_block_size(encoded)
     
     # Add hex logging to match iOS format
     hex_string = ' '.join(f'{b:02X}' for b in encoded)

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, Callable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hmac import HMAC
@@ -606,8 +607,12 @@ class EncryptionService:
     """
     
     def __init__(self, identity_path: Optional[str] = None):
-        # Load or create static identity key
+        # Load or create static identity key (X25519 for Noise handshake)
         self.static_identity_key = self._load_or_create_identity(identity_path)
+        
+        # Load or create Ed25519 signing key (separate from Noise key)
+        signing_path = (identity_path + '.signing') if identity_path else None
+        self.signing_private_key = self._load_or_create_signing_key(signing_path)
         
         # Active Noise sessions
         self.sessions: Dict[str, NoiseSession] = {}
@@ -652,6 +657,35 @@ class EncryptionService:
         
         return key
     
+    def _load_or_create_signing_key(self, signing_path: Optional[str]) -> Ed25519PrivateKey:
+        """Load existing Ed25519 signing key or create new one"""
+        if signing_path and os.path.exists(signing_path):
+            try:
+                with open(signing_path, 'rb') as f:
+                    key_data = f.read()
+                return Ed25519PrivateKey.from_private_bytes(key_data)
+            except Exception:
+                pass  # Fall through to create new key
+        
+        # Create new Ed25519 signing key
+        key = Ed25519PrivateKey.generate()
+        
+        # Save if path provided
+        if signing_path:
+            try:
+                os.makedirs(os.path.dirname(signing_path) if os.path.dirname(signing_path) else '.', exist_ok=True)
+                with open(signing_path, 'wb') as f:
+                    f.write(key.private_bytes(
+                        encoding=serialization.Encoding.Raw,
+                        format=serialization.PrivateFormat.Raw,
+                        encryption_algorithm=serialization.NoEncryption()
+                    ))
+                os.chmod(signing_path, 0o600)
+            except Exception:
+                pass  # Signing key will be ephemeral
+        
+        return key
+    
     def get_identity_fingerprint(self) -> str:
         """Get our identity fingerprint"""
         public_key = self.static_identity_key.public_key()
@@ -678,10 +712,11 @@ class EncryptionService:
         return self.get_public_key_bytes()
     
     def get_signing_public_key_bytes(self) -> bytes:
-        """Get signing public key bytes (for now, same as static key)"""
-        # For compatibility with Swift, we'll use the same key for signing
-        # In a full implementation, this would be a separate Ed25519 key
-        return self.get_public_key_bytes()
+        """Get Ed25519 signing public key bytes (32 bytes, raw format)"""
+        return self.signing_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
     
     def initiate_handshake(self, peer_id: str) -> bytes:
         """Initiate Noise handshake with a peer"""
@@ -820,10 +855,8 @@ class EncryptionService:
         return None
     
     def sign_data(self, data: bytes) -> bytes:
-        """Sign data with our identity key (placeholder for EdDSA)"""
-        # For now, return a simple hash-based signature
-        # In a real implementation, this would use EdDSA
-        return hashlib.sha256(data + self.get_public_key_bytes()).digest()
+        """Sign data with our Ed25519 signing key (64-byte signature)"""
+        return self.signing_private_key.sign(data)
     
     def remove_session(self, peer_id: str):
         """Remove session with a peer"""
