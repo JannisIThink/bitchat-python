@@ -640,7 +640,7 @@ class BitchatClient:
             # Log raw packet type byte for diagnostics (byte at offset 1 is msg_type)
             if len(data) >= 2:
                 raw_type = data[1]
-                print(f"[DIAG] Incoming BLE packet: {len(data)} bytes, raw_type=0x{raw_type:02x}")
+                debug_full_println(f"[DIAG] Incoming BLE packet: {len(data)} bytes, raw_type=0x{raw_type:02x}")
 
             # Parse packet using two-pass strategy (matching Android):
             # 1st pass: try parsing raw data (decoder reads by field position, ignores trailing padding)
@@ -649,7 +649,7 @@ class BitchatClient:
 
             if packet is None:
                 debug_full_println(f"[ERROR] Failed to parse packet: decode returned None")
-                print(f"[DIAG] PARSE FAILED: raw_len={len(data)}, first_bytes={data[:16].hex() if len(data) >= 16 else data.hex()}")
+                debug_full_println(f"[DIAG] PARSE FAILED: raw_len={len(data)}, first_bytes={data[:16].hex() if len(data) >= 16 else data.hex()}")
                 return
 
             # Ignore our own messages (they are already displayed when sent)
@@ -661,7 +661,7 @@ class BitchatClient:
         except Exception as e:
             try:
                 debug_full_println(f"[ERROR] Failed to parse packet: {e}")
-                print(f"[DIAG] EXCEPTION in notification_handler: {type(e).__name__}: {e}")
+                debug_full_println(f"[DIAG] EXCEPTION in notification_handler: {type(e).__name__}: {e}")
             except BlockingIOError:
                 # Silently ignore blocking errors
                 pass
@@ -1139,7 +1139,7 @@ class BitchatClient:
     async def handle_noise_encrypted(self, packet: BitchatPacket, raw_data: bytes):
         """Handle Noise encrypted message"""
         debug_println(f"[NOISE] Received encrypted message from {packet.sender_id_str}")
-        print(f"[DIAG] handle_noise_encrypted called: sender={packet.sender_id_str[:8]}, payload={len(packet.payload)} bytes")
+        debug_full_println(f"[DIAG] handle_noise_encrypted called: sender={packet.sender_id_str[:8]}, payload={len(packet.payload)} bytes")
 
         # Check if sender is blocked
         fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
@@ -1164,7 +1164,7 @@ class BitchatClient:
             # Decrypt the Noise encrypted payload
             decrypted_payload = self.encryption_service.decrypt_from_peer(packet.sender_id_str, payload_bytes)
             debug_println(f"[NOISE] Successfully decrypted {len(decrypted_payload)} bytes from {packet.sender_id_str}")
-            print(f"[DIAG] Decryption SUCCESS: {len(decrypted_payload)} bytes, hex={decrypted_payload[:20].hex()}")
+            debug_full_println(f"[DIAG] Decryption SUCCESS: {len(decrypted_payload)} bytes, hex={decrypted_payload[:20].hex()}")
 
             try:
                 # Parse as NoisePayload: [type_byte][data]
@@ -1252,7 +1252,7 @@ class BitchatClient:
 
         except Exception as e:
             debug_println(f"[NOISE] Failed to decrypt message from {packet.sender_id_str}: {e}")
-            print(f"[DIAG] DECRYPTION FAILED from {packet.sender_id_str[:8]}: {type(e).__name__}: {e}")
+            debug_full_println(f"[DIAG] DECRYPTION FAILED from {packet.sender_id_str[:8]}: {type(e).__name__}: {e}")
             # Check if we have a session with this peer
             if not self.encryption_service.is_session_established(packet.sender_id_str):
                 debug_println(f"[NOISE] No session established with {packet.sender_id_str}")
@@ -2704,7 +2704,7 @@ class BitchatClient:
             # Encrypt the NoisePayload (matching Android/iOS)
             encrypted = self.encryption_service.encrypt_for_peer(target_peer_id, bytes(noise_payload))
             debug_println(f"[PRIVATE] Encrypted NoisePayload: {len(encrypted)} bytes")
-            print(f"[DIAG] Encrypted message for {target_peer_id[:8]}: {len(encrypted)} bytes (nonce: {encrypted[:4].hex()})")
+            debug_full_println(f"[DIAG] Encrypted message for {target_peer_id[:8]}: {len(encrypted)} bytes (nonce: {encrypted[:4].hex()})")
 
             # Create outer Noise encrypted packet
             packet = create_bitchat_packet_with_recipient(
@@ -2714,12 +2714,12 @@ class BitchatClient:
                 encrypted,
                 None
             )
-            print(f"[DIAG] Created NOISE_ENCRYPTED packet: {len(packet)} bytes, sending...")
+            debug_full_println(f"[DIAG] Created NOISE_ENCRYPTED packet: {len(packet)} bytes, sending...")
 
             # Send with better error handling for BLE issues
             try:
                 await self.send_packet(packet)
-                print(f"[DIAG] NOISE_ENCRYPTED packet sent successfully to {target_peer_id[:8]}")
+                debug_full_println(f"[DIAG] NOISE_ENCRYPTED packet sent successfully to {target_peer_id[:8]}")
 
                 # Display sent message
                 timestamp = datetime.now()
