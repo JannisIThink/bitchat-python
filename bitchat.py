@@ -612,9 +612,21 @@ class BitchatClient:
             original_recipient = None
             original_route = None
 
-        # Android uses dynamic fragment size: 512 - (headerSize + senderSize + recipientSize + routeSize + fragmentHeaderSize + paddingBuffer)
-        # Default MAX_FRAGMENT_SIZE from AppConstants = 469
-        fragment_size = 469
+        # Dynamic fragment size matching Android FragmentManager.calculateMaxFragmentDataSize()
+        # packetOverhead = headerSize + senderSize + recipientSize + routeSize + fragmentHeaderSize + paddingBuffer
+        header_size = 16  # V2 header
+        sender_size = 8
+        recipient_size = 8 if original_recipient else 0
+        route_size = (1 + len(original_route) * 8) if original_route else 0
+        frag_header_size = 13  # FragmentPayload header
+        padding_buffer = 16   # MessagePadding.optimalBlockSize adds 16
+        packet_overhead = header_size + sender_size + recipient_size + route_size + frag_header_size + padding_buffer
+        fragment_size = min(512 - packet_overhead, 469)  # Cap at Android MAX_FRAGMENT_SIZE
+        if fragment_size <= 0:
+            print(f"\r\033[K\033[91m✗ Fragment size calculation error (overhead={packet_overhead})\033[0m")
+            print("> ", end='', flush=True)
+            return
+        debug_println(f"[FRAG] Fragment data size: {fragment_size} bytes (overhead: {packet_overhead})")
         chunks = [unpadded_packet[i:i+fragment_size] for i in range(0, len(unpadded_packet), fragment_size)]
         total_fragments = len(chunks)
 
@@ -660,7 +672,7 @@ class BitchatClient:
                     response=False
                 )
 
-                debug_println(f"[FRAG] ✓ Fragment {index + 1}/{total_fragments} sent")
+                debug_println(f"[FRAG] ✓ Fragment {index + 1}/{total_fragments} sent ({len(fragment_packet)} bytes)")
 
                 if index < len(chunks) - 1:
                     await asyncio.sleep(0.02)  # 20ms delay
@@ -671,7 +683,9 @@ class BitchatClient:
                         self.handle_disconnect(self.client)
                     return
                 else:
-                    raise e
+                    print(f"\r\033[K\033[91m✗ Failed to send fragment {index + 1}/{total_fragments}: {e}\033[0m")
+                    print("> ", end='', flush=True)
+                    return
 
     async def notification_handler(self, sender: BleakGATTCharacteristic, data: bytes, noRelay: bool = False):
         """Handle incoming BLE notifications"""
@@ -976,7 +990,7 @@ class BitchatClient:
         print("> ", end='', flush=True)
 
     async def handle_fragment(self, packet: BitchatPacket, raw_data: bytes,noRelay : bool = False):
-        """Handle message fragment"""
+        """Handle message fragment (matching Android FragmentManager.handleFragment)"""
         if len(packet.payload) >= 13:
             fragment_id = packet.payload[0:8]
             index = struct.unpack('>H', packet.payload[8:10])[0]
@@ -984,14 +998,25 @@ class BitchatClient:
             original_type = packet.payload[12]
             fragment_data = packet.payload[13:]
 
+            debug_println(f"[FRAG] Received fragment {index + 1}/{total} (ID: {fragment_id.hex()[:8]}, type: 0x{original_type:02x}, {len(fragment_data)} bytes)")
+
             result = self.fragment_collector.add_fragment(
                 fragment_id, index, total, original_type, fragment_data, packet.sender_id_str
             )
 
             if result:
                 complete_data, _ = result
+                debug_println(f"[FRAG] ✓ All {total} fragments reassembled ({len(complete_data)} bytes)")
                 reassembled_packet = parse_bitchat_packet(complete_data)
-                await self.handle_packet(reassembled_packet, complete_data)
+                if reassembled_packet is not None:
+                    # Android sets TTL=0 on reassembled packets to prevent re-relay
+                    reassembled_packet.ttl = 0
+                    await self.handle_packet(reassembled_packet, complete_data)
+                else:
+                    print(f"\r\033[K\033[91m✗ Failed to parse reassembled fragment data ({len(complete_data)} bytes)\033[0m")
+                    print("> ", end='', flush=True)
+        else:
+            debug_println(f"[FRAG] Fragment payload too short: {len(packet.payload)} bytes (need >= 13)")
 
         # Relay fragment if TTL > 1
         if packet.ttl > 1:
@@ -3127,29 +3152,52 @@ def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
     return None
 
 def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
-    """Parse message payload, matching Swift implementation"""
+    """Parse message payload, matching Swift implementation.
+    Raises ValueError if payload is raw UTF-8 text (not structured format).
+    """
+    if len(data) < 12:
+        raise ValueError("Payload too short for structured format")
+
     offset = 0
 
-    # 1. Flags
+    # 1. Flags — valid structured flags are 0x00-0x0F (only 4 flag bits defined)
+    # Raw UTF-8 text starts with printable ASCII (>= 0x20), so flags >= 0x10 means raw text
     flags = data[offset]; offset += 1
+    if flags > 0x0F:
+        raise ValueError(f"Invalid flags byte 0x{flags:02x} — likely raw UTF-8 payload")
+
     is_private = (flags & MSG_FLAG_IS_PRIVATE) != 0
     has_sender_peer_id = (flags & MSG_FLAG_HAS_SENDER_PEER_ID) != 0
     has_channel = (flags & MSG_FLAG_HAS_CHANNEL) != 0
     is_encrypted = (flags & MSG_FLAG_IS_ENCRYPTED) != 0
 
     # 2. Timestamp
+    if offset + 8 > len(data):
+        raise ValueError("Not enough data for timestamp")
     offset += 8 # Skip timestamp
 
     # 3. ID
+    if offset >= len(data):
+        raise ValueError("Not enough data for id_len")
     id_len = data[offset]; offset += 1
+    if id_len == 0 or id_len > 100 or offset + id_len > len(data):
+        raise ValueError(f"Invalid id_len={id_len}")
     id_str = data[offset:offset+id_len].decode('utf-8'); offset += id_len
 
     # 4. Sender
+    if offset >= len(data):
+        raise ValueError("Not enough data for sender_len")
     sender_len = data[offset]; offset += 1
+    if sender_len == 0 or sender_len > 100 or offset + sender_len > len(data):
+        raise ValueError(f"Invalid sender_len={sender_len}")
     sender = data[offset:offset+sender_len].decode('utf-8'); offset += sender_len
 
     # 5. Content
+    if offset + 2 > len(data):
+        raise ValueError("Not enough data for content_len")
     content_len = struct.unpack('>H', data[offset:offset+2])[0]; offset += 2
+    if offset + content_len > len(data):
+        raise ValueError(f"content_len={content_len} exceeds remaining data")
     content_bytes = data[offset:offset+content_len]; offset += content_len
     content = ""
     encrypted_content = None
@@ -3160,12 +3208,16 @@ def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
 
     # 6. Sender Peer ID
     if has_sender_peer_id:
+        if offset >= len(data):
+            raise ValueError("Not enough data for peer_id_len")
         peer_id_len = data[offset]; offset += 1
         offset += peer_id_len # Skip peer id
 
     # 7. Channel
     channel = None
     if has_channel:
+        if offset >= len(data):
+            raise ValueError("Not enough data for channel_len")
         channel_len = data[offset]; offset += 1
         channel = data[offset:offset+channel_len].decode('utf-8')
 
