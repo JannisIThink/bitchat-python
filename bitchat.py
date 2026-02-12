@@ -809,13 +809,34 @@ class BitchatClient:
             except NoiseError:
                 debug_println("[PRIVATE] Failed to decrypt private message")
                 return
-        # Parse message first to check if it's actually a private message
+        # Parse message payload
+        # Android sends raw UTF-8 text as MESSAGE payload, Python structured format is different.
+        # Try structured format first (Python-to-Python), fallback to raw text (Android compat).
         try:
             if is_private_message and decrypted_payload:
                 unpadded = unpad_message(decrypted_payload)
                 message = parse_bitchat_message_payload(unpadded)
             else:
                 message = parse_bitchat_message_payload(packet.payload)
+        except Exception as e:
+            # Fallback: Android sends raw UTF-8 text as MESSAGE payload
+            try:
+                raw_text = bytes(packet.payload).decode('utf-8', errors='ignore')
+                sender_nick = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str[:8]
+                message = BitchatMessage(
+                    id=f"{packet.timestamp}-{packet.sender_id_str[:8]}",
+                    content=raw_text,
+                    sender=sender_nick,
+                    channel=None,
+                    is_encrypted=False,
+                    encrypted_content=None
+                )
+                debug_println(f"[MESSAGE] Parsed as raw UTF-8 text: '{raw_text[:50]}'")
+            except Exception as e2:
+                debug_full_println(f"[ERROR] Failed to parse message: {e}, fallback error: {e2}")
+                return
+
+        try:
             # Check for duplicates using both bloom filter and set
             if message.id not in self.processed_messages:
                 # Add to bloom filter and set
@@ -843,7 +864,7 @@ class BitchatClient:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
 
         except Exception as e:
-            debug_full_println(f"[ERROR] Failed to parse message: {e}")
+            debug_full_println(f"[ERROR] Failed to handle message: {e}")
 
     async def display_message(self, message: BitchatMessage, packet: BitchatPacket, is_private: bool):
         """Display a message in the terminal"""
@@ -2520,19 +2541,18 @@ class BitchatClient:
                 print(f"❌ Cannot send to password-protected channel {current_channel}. Join with password first.")
                 return
 
-        # Create message payload
+        # Create message payload — Android uses raw UTF-8 text for public MESSAGE payloads
+        message_id = str(uuid.uuid4())
         if current_channel and current_channel in self.channel_keys:
-            # Encrypted channel message
+            # Encrypted channel message — use structured format for channel info
             creator_fingerprint = self.channel_creators.get(current_channel, '')
             encrypted_content = self.encryption_service.encrypt_for_channel(content, current_channel, self.channel_keys[current_channel], creator_fingerprint)
             payload, message_id = create_bitchat_message_payload_full(
                 self.nickname, content, current_channel, False, self.my_peer_id, True, encrypted_content
             )
         else:
-            # Regular message
-            payload, message_id = create_bitchat_message_payload_full(
-                self.nickname, content, current_channel, False, self.my_peer_id, False, None
-            )
+            # Regular public message — send raw UTF-8 to match Android format
+            payload = content.encode('utf-8')
 
         # Track for delivery
         self.delivery_tracker.track_message(message_id, content, False)
