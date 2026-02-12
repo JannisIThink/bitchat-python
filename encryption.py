@@ -17,7 +17,6 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hmac import HMAC
 import hashlib
-from bitchat import debug_println, debug_full_println
 
 # Noise Protocol Constants
 NOISE_PROTOCOL_NAME = "Noise_XX_25519_ChaChaPoly_SHA256"
@@ -91,9 +90,9 @@ class NoiseHandshakeState:
         self._mix_hash(b'')
         
         self.hash_state_before_mix = self.hash_state
-        debug_full_println(f"[NOISE-INIT] Protocol name: {NOISE_PROTOCOL_NAME}")
-        debug_full_println(f"[NOISE-INIT] Initial hash_state after prologue mix (32 bytes): {self.hash_state.hex()}")
-        debug_full_println(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
+        #print(f"[NOISE-INIT] Protocol name: {NOISE_PROTOCOL_NAME}")
+        #print(f"[NOISE-INIT] Initial hash_state after prologue mix (32 bytes): {self.hash_state.hex()}")
+        #print(f"[NOISE-INIT] Initial chaining_key: {self.chaining_key.hex()[:32]}...")
     
     def _mix_key(self, input_key_material: bytes):
         """Mix key material into chaining key and update cipher (Noise mixKey).
@@ -102,14 +101,14 @@ class NoiseHandshakeState:
         chaining key and cipher key. This must match Noise reference behavior
         (Android/iOS).
         """
-        debug_full_println(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
-        debug_full_println(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
+        #print(f"[NOISE-MIX] _mix_key called with IKM (first 32 hex): {input_key_material.hex()[:32]}...")
+        #print(f"[NOISE-MIX] Current chaining_key (first 32 hex): {self.chaining_key.hex()[:32]}...")
 
         # HKDF extract step: tempKey = HMAC(chainingKey, inputKeyMaterial)
         hmac = HMAC(self.chaining_key, hashes.SHA256())
         hmac.update(input_key_material)
         temp_key = hmac.finalize()
-        debug_full_println(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (first 32 hex): {temp_key.hex()[:32]}...")
+        #print(f"[NOISE-MIX] temp_key HMAC(CK, IKM) (first 32 hex): {temp_key.hex()[:32]}...")
 
         # HKDF expand step: generate 2 outputs per OFFICIAL Noise spec
         # This is the standard method used by iOS, Android, and other implementations
@@ -123,8 +122,8 @@ class NoiseHandshakeState:
         hmac2.update(output1 + b'\x02')
         output2 = hmac2.finalize()
 
-        debug_full_println(f"[NOISE-MIX] output1 (new CK, first 32 hex): {output1.hex()[:32]}...")
-        debug_full_println(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
+        #print(f"[NOISE-MIX] output1 (new CK, first 32 hex): {output1.hex()[:32]}...")
+        #print(f"[NOISE-MIX] output2 (cipher key, first 32 hex): {output2.hex()[:32]}...")
 
         # Per OFFICIAL Noise spec: output1 becomes chaining key, output2 becomes cipher key
         # NOTE: mixKey does NOT mix output2 into the hash
@@ -142,7 +141,7 @@ class NoiseHandshakeState:
         digest.update(data)
         old_hash = self.hash_state
         self.hash_state = digest.finalize()
-        debug_full_println(f"[NOISE-HASH] MixHash: old={old_hash.hex()[:16]}... input_len={len(data)}, new={self.hash_state.hex()[:16]}...")
+        #print(f"[NOISE-HASH] MixHash: old={old_hash.hex()[:16]}... input_len={len(data)}, new={self.hash_state.hex()[:16]}...")
     
     def _mix_key_and_hash(self, input_key_material: bytes):
         """Mix key material into both chaining key and hash"""
@@ -212,9 +211,9 @@ class NoiseHandshakeState:
             format=serialization.PublicFormat.Raw
         )
         shared_key = private_key.exchange(public_key)
-        debug_full_println(f"[NOISE-DH] Pattern '{pattern}': private key (full 64 hex): {private_bytes.hex()}")
-        debug_full_println(f"[NOISE-DH] Pattern '{pattern}': public key (full 64 hex): {public_bytes.hex()}")
-        debug_full_println(f"[NOISE-DH] Pattern '{pattern}': shared key (full 64 hex): {shared_key.hex()}")
+        #print(f"[NOISE-DH] Pattern '{pattern}': private key (full 64 hex): {private_bytes.hex()}")
+        #print(f"[NOISE-DH] Pattern '{pattern}': public key (full 64 hex): {public_bytes.hex()}")
+        #print(f"[NOISE-DH] Pattern '{pattern}': shared key (full 64 hex): {shared_key.hex()}")
         return shared_key
     
     def write_message(self, payload: bytes = b'') -> bytes:
@@ -236,7 +235,7 @@ class NoiseHandshakeState:
                 )
                 message_buffer.extend(ephemeral_bytes)
                 self._mix_hash(ephemeral_bytes)
-                debug_full_println(f"[NOISE-WRITE] Generated local ephemeral e (full 64 hex): {ephemeral_bytes.hex()}")
+                #print(f"[NOISE-WRITE] Generated local ephemeral e (full 64 hex): {ephemeral_bytes.hex()}")
             
             elif pattern == 's':
                 # Send static key (encrypted if cipher is initialized)
@@ -244,10 +243,10 @@ class NoiseHandshakeState:
                     encoding=serialization.Encoding.Raw,
                     format=serialization.PublicFormat.Raw
                 )
-                debug_full_println(f"[NOISE-WRITE] Encrypting local static key (full 64 hex): {static_bytes.hex()}")
-                debug_full_println(f"[NOISE-WRITE] Cipher has key: {self.cipher_state.has_key()}")
+                #print(f"[NOISE-WRITE] Encrypting local static key (full 64 hex): {static_bytes.hex()}")
+                #print(f"[NOISE-WRITE] Cipher has key: {self.cipher_state.has_key()}")
                 encrypted = self._encrypt_and_hash(static_bytes)
-                debug_full_println(f"[NOISE-WRITE] Encrypted static (len={len(encrypted)}): {encrypted[:50].hex()}...")
+                #print(f"[NOISE-WRITE] Encrypted static (len={len(encrypted)}): {encrypted[:50].hex()}...")
                 message_buffer.extend(encrypted)
             
             elif pattern == 'ee':
@@ -299,7 +298,7 @@ class NoiseHandshakeState:
         buffer = message
         patterns = self.message_patterns[self.current_pattern]
         
-        debug_full_println(f"[NOISE-READ] Pattern {self.current_pattern}: {patterns}, input_len={len(message)}")
+        #print(f"[NOISE-READ] Pattern {self.current_pattern}: {patterns}, input_len={len(message)}")
         
         for pattern in patterns:
             if pattern == 'e':
@@ -311,8 +310,8 @@ class NoiseHandshakeState:
                 
                 self.remote_ephemeral_public = X25519PublicKey.from_public_bytes(ephemeral_data)
                 self._mix_hash(ephemeral_data)
-                debug_full_println(f"[NOISE-READ] ✓ Read ephemeral e: {ephemeral_data.hex()[:32]}...")
-                debug_full_println(f"[NOISE-READ] Remote ephemeral (full 64 hex): {ephemeral_data.hex()}")
+                #print(f"[NOISE-READ] ✓ Read ephemeral e: {ephemeral_data.hex()[:32]}...")
+                #print(f"[NOISE-READ] Remote ephemeral (full 64 hex): {ephemeral_data.hex()}")
             
             elif pattern == 's':
                 # Read static key (encrypted if cipher is initialized)
@@ -330,19 +329,19 @@ class NoiseHandshakeState:
                 static_data = buffer[:key_length]
                 buffer = buffer[key_length:]
                 
-                debug_full_println(f"[NOISE-READ] Decrypting static s: len={len(static_data)}, cipher_has_key={self.cipher_state.has_key()}")
-                debug_full_println(f"[NOISE-READ] Cipher key (first 16 bytes hex): {self.cipher_state.key[:16].hex() if self.cipher_state.key else 'None'}")
-                debug_full_println(f"[NOISE-READ] Hash state BEFORE decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
-                debug_full_println(f"[NOISE-READ] Static ciphertext (first 24 hex): {static_data[:24].hex()[:48]}...")
-                debug_full_println(f"[NOISE-READ] Will use hash as AD: {self.hash_state.hex()[:32]}...")
+                #print(f"[NOISE-READ] Decrypting static s: len={len(static_data)}, cipher_has_key={self.cipher_state.has_key()}")
+                #print(f"[NOISE-READ] Cipher key (first 16 bytes hex): {self.cipher_state.key[:16].hex() if self.cipher_state.key else 'None'}")
+                #print(f"[NOISE-READ] Hash state BEFORE decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
+                #print(f"[NOISE-READ] Static ciphertext (first 24 hex): {static_data[:24].hex()[:48]}...")
+                #print(f"[NOISE-READ] Will use hash as AD: {self.hash_state.hex()[:32]}...")
                 
                 try:
                     decrypted = self._decrypt_and_hash(static_data)
                     self.remote_static_public = X25519PublicKey.from_public_bytes(decrypted)
-                    debug_full_println(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
-                    debug_full_println(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
+                    #print(f"[NOISE-READ] ✓ Decrypted static: {decrypted.hex()[:32]}...")
+                    #print(f"[NOISE-READ] Hash state AFTER decrypt (first 16 hex): {self.hash_state.hex()[:16]}...")
                 except Exception as e:
-                    debug_full_println(f"[NOISE-READ] Static key decryption failed: {type(e).__name__}: {e}")
+                    #print(f"[NOISE-READ] Static key decryption failed: {type(e).__name__}: {e}")
                     raise
             
             elif pattern in ['ee', 'es', 'se']:
@@ -723,17 +722,17 @@ class EncryptionService:
         """Initiate Noise handshake with a peer"""
         # Clean up any existing handshake state and session
         if peer_id in self.handshake_states:
-            #debug_full_println(f"[NOISE] Cleaning up existing handshake state for {peer_id}")
+            ##print(f"[NOISE] Cleaning up existing handshake state for {peer_id}")
             del self.handshake_states[peer_id]
         
         if peer_id in self.sessions:
-            #debug_full_println(f"[NOISE] Removing existing session for {peer_id}")
+            ##print(f"[NOISE] Removing existing session for {peer_id}")
             del self.sessions[peer_id]
         
         # Create new handshake state as initiator
         handshake = NoiseHandshakeState(NoiseRole.INITIATOR, self.static_identity_key)
         self.handshake_states[peer_id] = handshake
-        #debug_full_println(f"[NOISE] Initiating handshake with {peer_id}")
+        ##print(f"[NOISE] Initiating handshake with {peer_id}")
         
         # Write first message (-> e)
         return handshake.write_message()
@@ -751,29 +750,29 @@ class EncryptionService:
         # Check if we have an ongoing handshake
         if peer_id in self.handshake_states:
             handshake = self.handshake_states[peer_id]
-            #debug_full_println(f"[NOISE] Continuing handshake with {peer_id}, pattern {handshake.current_pattern}, role {handshake.role}")
+            ##print(f"[NOISE] Continuing handshake with {peer_id}, pattern {handshake.current_pattern}, role {handshake.role}")
         else:
             # New handshake from peer - we are responder
             handshake = NoiseHandshakeState(NoiseRole.RESPONDER, self.static_identity_key)
             self.handshake_states[peer_id] = handshake
-            #debug_full_println(f"[NOISE] Starting new handshake with {peer_id} as responder")
+            ##print(f"[NOISE] Starting new handshake with {peer_id} as responder")
         
         # Validate handshake state
         if handshake.current_pattern >= len(handshake.message_patterns):
-            #debug_full_println(f"[NOISE] Warning: Handshake already complete with {peer_id}, ignoring message")
+            ##print(f"[NOISE] Warning: Handshake already complete with {peer_id}, ignoring message")
             return None
         
         try:
             # Read the incoming message
             payload = handshake.read_message(message)
-            #debug_full_println(f"[NOISE] Successfully processed pattern {handshake.current_pattern - 1} from {peer_id}")
+            ##print(f"[NOISE] Successfully processed pattern {handshake.current_pattern - 1} from {peer_id}")
             
             # Check if we need to send a response
             response = None
             if not handshake.is_handshake_complete():
                 # Generate response message
                 response = handshake.write_message()
-                #debug_full_println(f"[NOISE] Generated response pattern {handshake.current_pattern - 1} for {peer_id}")
+                ##print(f"[NOISE] Generated response pattern {handshake.current_pattern - 1} for {peer_id}")
             
             # Check if handshake is now complete
             if handshake.is_handshake_complete():
@@ -794,7 +793,7 @@ class EncryptionService:
                     
                     # Cleanup handshake state
                     del self.handshake_states[peer_id]
-                    #debug_full_println(f"[NOISE] Handshake completed with {peer_id}")
+                    ##print(f"[NOISE] Handshake completed with {peer_id}")
                     
                     # Notify authentication
                     if self.on_peer_authenticated:
@@ -807,12 +806,12 @@ class EncryptionService:
             # Handshake failed, cleanup
             if peer_id in self.handshake_states:
                 del self.handshake_states[peer_id]
-            #debug_full_println(f"[NOISE] Handshake failed with {peer_id}: {type(e).__name__}: {e}")
-            #debug_full_println(f"[NOISE] Message length: {len(message)}, first 32 bytes: {message[:32].hex()}")
+            ##print(f"[NOISE] Handshake failed with {peer_id}: {type(e).__name__}: {e}")
+            ##print(f"[NOISE] Message length: {len(message)}, first 32 bytes: {message[:32].hex()}")
             import traceback
-            #debug_full_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
-            #debug_full_println(f"[NOISE] Original exception type: {type(e).__name__}")
-            #debug_full_println(f"[NOISE] Original exception message: {str(e)}")
+            ##print(f"[NOISE] Handshake error details: {traceback.format_exc()}")
+            ##print(f"[NOISE] Original exception type: {type(e).__name__}")
+            ##print(f"[NOISE] Original exception message: {str(e)}")
             raise NoiseError(f"Handshake failed: {e}")
     
     def handle_handshake_message(self, peer_id: str, message: bytes) -> Optional[bytes]:
@@ -869,7 +868,7 @@ class EncryptionService:
     def clear_handshake_state(self, peer_id: str):
         """Clear handshake state for a peer (used when handshake fails)"""
         if peer_id in self.handshake_states:
-            #debug_full_println(f"[NOISE] Clearing failed handshake state for {peer_id}")
+            ##print(f"[NOISE] Clearing failed handshake state for {peer_id}")
             del self.handshake_states[peer_id]
     
     def cleanup_old_sessions(self, max_age: float = 3600):
