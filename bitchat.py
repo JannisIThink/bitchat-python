@@ -923,7 +923,7 @@ class BitchatClient:
         print(f"\r\033[K{display}")
 
         if is_private and not isinstance(self.chat_context.current_mode, PrivateDM):
-            print("\033[90m» /reply to respond\033[0m")
+            print("\033[90m» /r <message> to reply\033[0m")
 
         print("> ", end='', flush=True)
 
@@ -2114,11 +2114,24 @@ class BitchatClient:
             await self.handle_dm_command(line)
             return
 
-        if line == "/reply":
+        if line == "/reply" or line.startswith("/reply ") or line == "/r" or line.startswith("/r "):
             if self.chat_context.last_private_sender:
                 peer_id, nickname = self.chat_context.last_private_sender
-                self.chat_context.enter_dm_mode(nickname, peer_id)
-                debug_println(self.chat_context.get_status_line())
+                # Check for inline message: /reply <message> or /r <message>
+                reply_text = None
+                if line.startswith("/reply "):
+                    reply_text = line[7:].strip()
+                elif line.startswith("/r "):
+                    reply_text = line[3:].strip()
+
+                if reply_text:
+                    # Send message directly and enter DM mode
+                    self.chat_context.enter_dm_mode(nickname, peer_id)
+                    await self.send_private_message(reply_text, peer_id, nickname)
+                else:
+                    # Just enter DM mode
+                    self.chat_context.enter_dm_mode(nickname, peer_id)
+                    debug_println(self.chat_context.get_status_line())
             else:
                 print("» No private messages received yet.")
             return

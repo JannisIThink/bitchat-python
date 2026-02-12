@@ -235,7 +235,7 @@ def print_help():
     print("  \033[90m(type normally to send in current mode)\033[0m")
     print("  \033[36m/dm\033[0m \033[90m<name>\033[0m    Start private conversation")
     print("  \033[36m/dm\033[0m \033[90m<name> <msg>\033[0m Send quick private message")
-    print("  \033[36m/reply\033[0m        Reply to last private message\n")
+    print("  \033[36m/reply\033[0m \033[90m[msg]\033[0m  Reply to last DM (shortcut: /r)\n")
     
     # Channels
     print("\033[38;5;40m▶ Channels\033[0m")
