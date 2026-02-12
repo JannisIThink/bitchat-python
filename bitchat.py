@@ -65,7 +65,7 @@ class DebugLevel(IntEnum):
     BASIC = 1
     FULL = 2
 
-DEBUG_LEVEL = DebugLevel.FULL
+DEBUG_LEVEL = DebugLevel.BASIC
 
 def debug_println(*args, **kwargs):
     if DEBUG_LEVEL >= DebugLevel.BASIC:
@@ -1197,6 +1197,13 @@ class BitchatClient:
 
                     if message_id and content:
                         debug_println(f"[NOISE] Private message: id={message_id[:16]}..., content={content[:30]}...")
+
+                        # Filter internal control messages (match Android's MessageHandler behavior)
+                        if content.startswith("[FAVORITED]") or content.startswith("[UNFAVORITED]"):
+                            debug_println(f"[NOISE] Filtered control message: {content[:40]}")
+                            # Still send delivery ACK for UX parity with Android
+                            await self.send_delivery_ack(message_id, packet.sender_id_str, True)
+                            return
 
                         # Check for duplicates
                         if message_id not in self.processed_messages:
