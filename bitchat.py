@@ -1958,11 +1958,38 @@ class BitchatClient:
                 print("\033[90mThis nickname is reserved and cannot be used.\033[0m")
             else:
                 self.nickname = new_name
+
+                # Send Noise Identity Announcement (TLV format) so Android updates the nickname
+                try:
+                    timestamp_ms = int(time.time() * 1000)
+                    public_key_bytes = self.encryption_service.get_public_key()
+                    signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
+
+                    timestamp_data = str(timestamp_ms).encode('utf-8')
+                    binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
+                    signature = self.encryption_service.sign_data(binding_data)
+
+                    identity_payload = self.encode_noise_identity_announcement_binary(
+                        self.my_peer_id, public_key_bytes, signing_public_key_bytes,
+                        self.nickname, timestamp_ms, signature
+                    )
+                    identity_packet = create_bitchat_packet(
+                        self.my_peer_id, MessageType.ANNOUNCE, identity_payload
+                    )
+                    identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
+                    await self.send_packet(identity_packet)
+                except Exception as e:
+                    debug_println(f"[NAME] Failed to send identity announcement: {e}")
+
+                await asyncio.sleep(0.3)
+
+                # Also send simple text announce as fallback
                 announce_packet = create_bitchat_packet(
                     self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                 )
                 announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
                 await self.send_packet(announce_packet)
+
                 print(f"\033[90m» Nickname changed to: {self.nickname}\033[0m")
                 await self.save_app_state()
             return
