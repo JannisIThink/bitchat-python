@@ -65,7 +65,7 @@ class DebugLevel(IntEnum):
     BASIC = 1
     FULL = 2
 
-DEBUG_LEVEL = DebugLevel.BASIC
+DEBUG_LEVEL = DebugLevel.CLEAN
 
 def debug_println(*args, **kwargs):
     if DEBUG_LEVEL >= DebugLevel.BASIC:
