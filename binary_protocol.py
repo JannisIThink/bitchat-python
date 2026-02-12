@@ -15,6 +15,7 @@ Packet structure (Variable length):
 import struct
 import time
 import os
+import zlib
 from enum import IntEnum
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
@@ -111,15 +112,27 @@ class BinaryProtocol:
             flags |= FLAG_HAS_RECIPIENT
         if packet.signature is not None:
             flags |= FLAG_HAS_SIGNATURE
-        is_compressed = False  # TODO: Implement compression
-        if is_compressed:
-            flags |= FLAG_IS_COMPRESSED
         if has_route and version >= 2:
             flags |= FLAG_HAS_ROUTE
 
-        # Calculate payload (including optional compression header)
+        # Try compression if payload is large enough (matching Android CompressionUtil)
+        COMPRESSION_THRESHOLD = 100
         payload_to_send = packet.payload
         original_size = None
+        is_compressed = False
+        if len(packet.payload) >= COMPRESSION_THRESHOLD:
+            try:
+                # Raw deflate (no headers) matching Android Deflater(true)
+                compress_obj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS)
+                compressed = compress_obj.compress(packet.payload) + compress_obj.flush()
+                if 0 < len(compressed) < len(packet.payload):
+                    payload_to_send = compressed
+                    original_size = len(packet.payload)
+                    is_compressed = True
+            except zlib.error:
+                pass  # Compression failed, send uncompressed
+        if is_compressed:
+            flags |= FLAG_IS_COMPRESSED
 
         # Build variable sections to determine final payload length
         variable_data = bytearray()
@@ -311,6 +324,19 @@ class BinaryProtocol:
         
         payload = data[offset:payload_end]
         offset = payload_end
+
+        # Decompress if IS_COMPRESSED flag is set (matching Android CompressionUtil.decompress)
+        # Android uses raw deflate (no zlib/gzip headers)
+        if flags & FLAG_IS_COMPRESSED and original_size is not None:
+            try:
+                # Try raw deflate first (Android default: Inflater(true))
+                payload = zlib.decompress(bytes(payload), -zlib.MAX_WBITS)
+            except zlib.error:
+                try:
+                    # Fallback: try with zlib headers (Android fallback: Inflater(false))
+                    payload = zlib.decompress(bytes(payload))
+                except zlib.error:
+                    return None  # Decompression failed
 
         # Signature (if HAS_SIGNATURE flag)
         signature = None
