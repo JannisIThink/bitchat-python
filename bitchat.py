@@ -668,7 +668,6 @@ class BitchatClient:
 
     async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle incoming packet"""
-        print(packet,packet.msg_type)
         if packet.msg_type == MessageType.ANNOUNCE:
             await self.handle_announce(packet)
         elif packet.msg_type == MessageType.MESSAGE:
