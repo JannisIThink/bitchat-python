@@ -392,12 +392,13 @@ class BitchatClient:
                 scan_attempts += 1
                 if scan_attempts == max_initial_attempts:
                     print("\033[93m» No other BitChat devices found yet.\033[0m")
-                    print("\033[90m» This might be because:\033[0m")
-                    print("\033[90m  • You're the first one here (that's okay!)\033[0m")
-                    print("\033[90m  • Other devices are out of Bluetooth range\033[0m")
-                    print("\033[90m  • The iOS/Android app needs to be open\033[0m")
+                    #print("\033[90m» This might be because:\033[0m")
+                    #print("\033[90m  • You're the first one here (that's okay!)\033[0m")
+                    #print("\033[90m  • Other devices are out of Bluetooth range\033[0m")
+                    #print("\033[90m  • The iOS/Android app needs to be open\033[0m")
                     print("\033[90m» Continuing to scan in the background...\033[0m")
-                    print("\033[90m» You can start using commands while waiting.\033[0m")
+                    if (self.toLoRa is None) and (self.fromLoRa is None):
+                        print("\033[90m» You can start using commands while waiting.\033[0m")
                     # Return True to continue without connection
                     return True
                 await asyncio.sleep(1)
@@ -438,11 +439,11 @@ class BitchatClient:
         except Exception as e:
             print(f"\n\033[91m❌ Connection failed\033[0m")
             print(f"\033[90mReason: {e}\033[0m")
-            print("\033[90mPlease check:\033[0m")
-            print("\033[90m  • Bluetooth is enabled\033[0m")
-            print("\033[90m  • The other device is running BitChat\033[0m")
-            print("\033[90m  • You're within range\033[0m")
-            print("\n\033[90mTry running the command again.\033[0m")
+            #print("\033[90mPlease check:\033[0m")
+            #print("\033[90m  • Bluetooth is enabled\033[0m")
+            #print("\033[90m  • The other device is running BitChat\033[0m")
+            #print("\033[90m  • You're within range\033[0m")
+            #print("\n\033[90mTry running the command again.\033[0m")
             return False
 
     async def handshake(self):
@@ -511,7 +512,8 @@ class BitchatClient:
 
         if self.app_state.nickname:
             print(f"\033[90m» Using saved nickname: {self.nickname}\033[0m")
-        print("\033[90m» Type /status to see connection info\033[0m")
+        if(self.toLoRa is None) and (self.fromLoRa is None):
+            print("\033[90m» Type /status to see connection info\033[0m")
 
         # Restore state
         self.blocked_peers = self.app_state.blocked_peers
@@ -1032,7 +1034,7 @@ class BitchatClient:
 
         print(f"\r\033[K{display}")
 
-        if is_private and not isinstance(self.chat_context.current_mode, PrivateDM):
+        if is_private and not isinstance(self.chat_context.current_mode, PrivateDM) and ((self.fromLoRa is None) and (self.toLoRa is None)):
             print("\033[90m» /r <message> to reply\033[0m")
 
         print("> ", end='', flush=True)
@@ -2019,7 +2021,7 @@ class BitchatClient:
                     self.my_peer_id, MessageType.LEAVE, self.nickname.encode()
                 )
                 await self.send_packet(leave_packet)
-                await asyncio.sleep(0.1)  # Give time for the packet to send
+                await asyncio.sleep(0.5)  # Give time for the packet to send
 
             await self.save_app_state()
             self.running = False
@@ -2143,17 +2145,17 @@ class BitchatClient:
             pending_messages = sum(len(msgs) for msgs in self.pending_private_messages.values())
 
             print("\n╭─── Connection Status ──────╮")
-            print(f"│ Status: {connection_status:^18} │")
-            print(f"│ Peers connected: {peer_count:6}     │")
-            print(f"│ Active channels: {channel_count:6}     │")
+            print(f"│ Status: {connection_status:^18}│")
+            print(f"│ Peers connected: {peer_count:6}    │")
+            print(f"│ Active channels: {channel_count:6}    │")
             print(f"│ Active DMs:      {dm_count:6}     │")
-            print("│                           │")
-            print(f"│ Secure sessions: {session_count:6}     │")
-            print(f"│ Pending handshakes: {pending_handshakes:3}     │")
-            print(f"│ Queued messages: {pending_messages:6}     │")
-            print("│                           │")
-            print(f"│ Your nickname: {self.nickname[:11]:^11}  │")
-            print(f"│ Your ID: {self.my_peer_id[:8]}...    │")
+            print("│                            │")
+            print(f"│ Secure sessions: {session_count:6}    │")
+            print(f"│ Pending handshakes: {pending_handshakes:3}    │")
+            print(f"│ Queued messages: {pending_messages:6}    │")
+            print("│                            │")
+            print(f"│ Your nickname: {self.nickname[:11]:^11} │")
+            print(f"│ Your ID: {self.my_peer_id[:8]}...      │")
             print("╰───────────────────────────╯")
 
             # Show encryption session details if any
@@ -3005,8 +3007,11 @@ class BitchatClient:
         # Run input loop
         try:
             if (self.fromLoRa == None) and (self.toLoRa == None):
+                print("🚀 Running in normal mode, messages are not sent over LoRa. Client will work normally.")
                 await self.input_loop()
             else:
+                print("🚀 Running in LoRa mode, bridging messages between BLE and LoRa queues...")
+                print("Any commands typed here will be ignored, as LoRa mode, presume no 'normal' client activity. To use normal client features, run without LoRa queues connected.")
                 await self.fromLoraLoop()
         except KeyboardInterrupt:
             pass
