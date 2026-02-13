@@ -532,8 +532,8 @@ class BitchatClient:
                 except Exception as e:
                     debug_println(f"[CHANNEL] Failed to restore key for {channel}: {e}")
 
-    async def send_packet(self, packet: bytes):
-        """Send packet, with fragmentation if needed"""
+    async def send_packet(self, packet: bytes, via_lora: bool = True):
+        """Send packet via BLE (with fragmentation if needed), and optionally also via LoRa."""
         debug_full_println(f"[RAW SEND] {packet.hex()}")
         if not self.client or not self.characteristic:
             debug_println("[!] No connection available. Message queued.")
@@ -591,6 +591,10 @@ class BitchatClient:
                             raise e2
                 else:
                     raise e
+
+        # Also send via LoRa (for originating packets; relays pass via_lora=False)
+        if via_lora and self.toLoRa is not None:
+            self.toLoRa.put(packet)
 
     async def send_packet_with_fragmentation(self, packet: bytes):
         """Fragment and send large packets (matching Android FragmentManager.createFragments)"""
@@ -728,6 +732,12 @@ class BitchatClient:
             if packet.sender_id_str == self.my_peer_id:
                 return
 
+            # Packet-level dedup: skip if we've already seen this exact packet
+            # (prevents double-processing when same packet arrives via BLE + LoRa)
+            if self._is_packet_seen(packet):
+                debug_full_println(f"[DEDUP] Duplicate packet from {packet.sender_id_str}, skipping")
+                return
+
             await self.handle_packet(packet, data, noRelay)
 
         except Exception as e:
@@ -762,8 +772,6 @@ class BitchatClient:
         """Relay a packet if TTL > 1 (shared relay logic for all packet types)."""
         if packet.ttl <= 1:
             return
-        if self._is_packet_seen(packet):
-            return
         await asyncio.sleep(random.uniform(0.01, 0.05))
         relay_data = bytearray(raw_data)
         relay_data[2] = packet.ttl - 1
@@ -774,9 +782,8 @@ class BitchatClient:
                 self.on_relay(relay_bytes)
             except Exception:
                 pass
-        await self.send_packet(relay_bytes)
+        await self.send_packet(relay_bytes, via_lora=False)
         if self.toLoRa is not None and not noRelay:
-            self.toLoRa: multiprocessing.Queue
             self.toLoRa.put(relay_bytes)
 
     async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
@@ -794,6 +801,9 @@ class BitchatClient:
         elif packet.msg_type == MessageType.LEAVE:
             await self.handle_leave(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.REQUEST_SYNC:
+            await self._relay_packet(packet, raw_data, noRelay)
+        elif packet.msg_type == MessageType.FILE_TRANSFER:
+            # Relay only — Python client does not process file transfers itself
             await self._relay_packet(packet, raw_data, noRelay)
 
     async def handle_announce(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
@@ -1954,37 +1964,9 @@ class BitchatClient:
             except Exception as e:
                 debug_println(f"[ACK] Failed to encrypt delivery ACK: {e}")
         else:
-            # Fallback: unencrypted DELIVERY_ACK packet
-            ack = DeliveryAck(
-                message_id,
-                str(uuid.uuid4()),
-                self.my_peer_id,
-                self.nickname,
-                int(time.time() * 1000),
-                1
-            )
-
-            ack_payload = json.dumps({
-                'originalMessageID': ack.original_message_id,
-                'ackID': ack.ack_id,
-                'recipientID': ack.recipient_id,
-                'recipientNickname': ack.recipient_nickname,
-                'timestamp': ack.timestamp,
-                'hopCount': ack.hop_count
-            }).encode()
-
-            ack_packet = create_bitchat_packet_with_recipient(
-                self.my_peer_id,
-                sender_id,
-                MessageType.DELIVERY_ACK,
-                ack_payload,
-                None
-            )
-
-            # Set TTL to 3
-            ack_packet_data = bytearray(ack_packet)
-            ack_packet_data[2] = 3
-            await self.send_packet(bytes(ack_packet_data))
+            # No Noise session available — cannot send unencrypted ACK
+            # (Android only supports ACKs as NoisePayloadType.DELIVERED inside NOISE_ENCRYPTED)
+            debug_println(f"[ACK] Skipping delivery ACK for {message_id} — no Noise session with {sender_id}")
 
     async def send_channel_announce(self, channel: str, is_protected: bool, key_commitment: Optional[str]):
         """Send channel announcement"""
