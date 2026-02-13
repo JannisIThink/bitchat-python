@@ -9,12 +9,10 @@ import struct
 import hashlib
 import random
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Set, Union
+from typing import Optional, Dict, List, Tuple, Set
 from dataclasses import dataclass, field
 from enum import IntEnum
-from collections import defaultdict
 import logging
-import base64
 import multiprocessing
 
 from bleak import BleakClient, BleakScanner, BleakGATTCharacteristic
@@ -809,7 +807,7 @@ class BitchatClient:
     async def handle_announce(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
         """Handle peer announcement"""
         peer_nickname = None
-        
+
         # Check if this is a Noise Identity Announcement (has signature) or simple text announce
         if packet.signature:
             # Parse as Noise Identity Announcement binary format
@@ -820,7 +818,7 @@ class BitchatClient:
             except Exception as e:
                 debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
                 peer_nickname = None
-        
+
         # Fallback to text decoding if we don't have a nickname yet
         if not peer_nickname:
             # Extract just the text part, skip binary  data
@@ -836,13 +834,13 @@ class BitchatClient:
                         current_text = bytearray()
             if current_text:
                 text_parts.append(current_text.decode('utf-8', errors='ignore').strip())
-            
+
             # Get the longest text part as nickname
             if text_parts:
                 peer_nickname = max(text_parts, key=len)
             else:
                 peer_nickname = packet.sender_id_str[:8]
-        
+
         is_new_peer = packet.sender_id_str not in self.peers
 
         if packet.sender_id_str not in self.peers:
@@ -1578,25 +1576,25 @@ class BitchatClient:
             debug_println(f"[NOISE] Raw data (hex): {data.hex()}")
 
             # Try multiple parsing strategies to handle iOS and Android formats
-            
+
             # Strategy 1: iOS format - flags | peerID(8) | pubKeyLen | pubKey(32) | sigKeyLen | sigKey(32) | nicknameLen | nickname | timestamp | ...
             result = self._try_parse_ios_format(data)
             if result:
                 debug_println("[NOISE] Successfully parsed with iOS format")
                 return result
-            
+
             # Strategy 2: Android format - flags | nicknameLen | nickname | pubKeyLen | pubKey  | sigKeyLen | sigKey | timestamp | ...
             result = self._try_parse_android_format(data)
             if result:
                 debug_println("[NOISE] Successfully parsed with Android format")
                 return result
-            
+
             # Strategy 3: Minimal format - just the core fields, peerID derived from pubKey
             result = self._try_parse_minimal_format(data)
             if result:
                 debug_println("[NOISE] Successfully parsed with minimal format")
                 return result
-            
+
             debug_println("[NOISE] All parsing strategies failed")
             return None
 
@@ -1611,73 +1609,73 @@ class BitchatClient:
 """
         try:
             offset = 0
-            
+
             if len(data) < 26:  # Minimum: flags(1) + peerID(8) + pubLen(1) + pubKey(32 min) won't fit, but let's be lenient
                 return None
-            
+
             # Read flags
             flags = data[offset]
             offset += 1
             has_prev_id = (flags & 0x01) != 0
-            
+
             # Read peerID (8 bytes) - check if this makes sense
             peer_id = data[offset:offset+8]
             offset += 8
-            
+
             # Next byte should be a reasonable length (32 for public key is typical)
             if offset >= len(data):
                 return None
-            
+
             pub_key_len = data[offset]
             offset += 1
-            
+
             # Sanity check: public key should be 32 bytes in Noise
             if pub_key_len != 32:
                 return None
-            
+
             if offset + pub_key_len > len(data):
                 return None
-            
+
             public_key = data[offset:offset+pub_key_len]
             offset += pub_key_len
-            
+
             # Next should be signing key length
             if offset >= len(data):
                 return None
-            
+
             sig_key_len = data[offset]
             offset += 1
-            
+
             # Signing key should also be 32 bytes
             if sig_key_len != 32:
                 return None
-            
+
             if offset + sig_key_len > len(data):
                 return None
-            
+
             signing_key = data[offset:offset+sig_key_len]
             offset += sig_key_len
-            
+
             # Next should be nickname length
             if offset >= len(data):
                 return None
-            
+
             nickname_len = data[offset]
             offset += 1
-            
+
             if offset + nickname_len > len(data):
                 return None
-            
+
             nickname = data[offset:offset+nickname_len].decode('utf-8', errors='ignore')
             offset += nickname_len
-            
+
             # Timestamp (8 bytes big-endian)
             if offset + 8 > len(data):
                 return None
-            
+
             timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
             offset += 8
-            
+
             # Read previous peer ID if flag set
             prev_peer_id = None
             if has_prev_id:
@@ -1685,19 +1683,19 @@ class BitchatClient:
                     return None
                 prev_peer_id = data[offset:offset+8].hex()
                 offset += 8
-            
+
             # Read signature
             if offset >= len(data):
                 return None
-            
+
             sig_len = data[offset]
             offset += 1
-            
+
             if offset + sig_len > len(data):
                 return None
-            
+
             signature = data[offset:offset+sig_len]
-            
+
             debug_println("[NOISE] iOS format parsed successfully")
             return {
                 'peerID': peer_id.hex(),
@@ -1716,26 +1714,26 @@ class BitchatClient:
         """Try Android format with type markers: flags | nicknameLen | nickname | (typeA) | pubKeyLen | pubKey | (typeB) | sigKeyLen | sigKey"""
         try:
             offset = 0
-            
+
             if len(data) < 20:
                 return None
-            
+
             # Read flags
             flags = data[offset]
             offset += 1
             has_prev_id = (flags & 0x01) != 0
-            
+
             # Next byte should be nickname length
             if offset >= len(data):
                 return None
-            
+
             nickname_len = data[offset]
             offset += 1
-            
+
             # Sanity: nickname shouldn't be huge
             if nickname_len > 255 or nickname_len > len(data) - offset:
                 return None
-            
+
             # Read nickname
             if nickname_len > 0:
                 try:
@@ -1745,84 +1743,84 @@ class BitchatClient:
                 offset += nickname_len
             else:
                 nickname = ""
-            
+
             # Skip unknown type/marker byte (0x02 or similar)
             if offset >= len(data):
                 return None
-            
+
             marker1 = data[offset]
             offset += 1
             # If this looks like a valid pubkey length, we skipped correctly
             # Otherwise this might BE the pubkey length, so backtrack
-            
+
             if offset >= len(data):
                 return None
-            
+
             # Try to read pub key length
             pub_key_len = data[offset]
             offset += 1
-            
+
             # Sanity: public key should be 32 bytes
             if pub_key_len != 32:
                 # Marker wasn't a marker, backtrack
                 offset = len(nickname.encode('utf-8')) + 2  # flags + nicklen
                 pub_key_len = data[offset]
                 offset += 1
-                
+
                 if pub_key_len != 32:
                     return None
-            
+
             if offset + pub_key_len > len(data):
                 return None
-            
+
             public_key = data[offset:offset+pub_key_len]
             offset += pub_key_len
-            
+
             # Skip unknown type/marker byte (0x03 or similar)
             if offset >= len(data):
                 return None
-            
+
             marker2 = data[offset]
             offset += 1
-            
+
             # Next should be signing key length
             if offset >= len(data):
                 return None
-            
+
             sig_key_len = data[offset]
             offset += 1
-            
+
             debug_println(f"[NOISE] Android format: sig_key_len={sig_key_len}, data remaining={len(data)-offset} bytes")
-            
+
             # Sanity: signing key should be 32 bytes, but accept shorter if that's all we have
             if sig_key_len != 32:
                 # Accept other common sizes (24, 16) or be lenient with truncated data
                 debug_println(f"[NOISE] Warning: Expected sig_key_len=32 but got {sig_key_len}")
                 if sig_key_len == 0:
                     return None  # 0-length key is still invalid
-            
+
             # Accept truncated key (if not enough data, use what we have)
             available_for_sig = len(data) - offset
             actual_sig_len = min(sig_key_len, available_for_sig)
-            
+
             if actual_sig_len < 16:  # At least some key material expected
                 debug_println(f"[NOISE] Error: signing key too short ({actual_sig_len} bytes)")
                 return None
-            
+
             signing_key = data[offset:offset+actual_sig_len]
             offset += actual_sig_len
-            
+
             debug_println(f"[NOISE] Accepted signing key of {actual_sig_len} bytes (expected {sig_key_len})")
-            
+
             # Try to read timestamp (8 bytes, big-endian)
             timestamp_ms = 0
             if offset + 8 <= len(data):
                 timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
                 offset += 8
-            
+
             # Derive peer ID from public key
             peer_id_derived = public_key[:8].hex()
-            
+
             debug_println("[NOISE] Android format (with markers) parsed successfully")
             return {
                 'peerID': peer_id_derived,
@@ -1841,50 +1839,50 @@ class BitchatClient:
         """Try minimal format: flags | pubKeyLen | pubKey | sigKeyLen | sigKey | ... (no peerID or nickname first)"""
         try:
             offset = 0
-            
+
             if len(data) < 70:  # At least flags(1) + pubLen(1) + pubKey(32) + sigLen(1) + sigKey(32) + ...
                 return None
-            
+
             # Read flags
             flags = data[offset]
             offset += 1
-            
+
             # Try reading as pub key length
             pub_key_len = data[offset]
             offset += 1
-            
+
             if pub_key_len != 32:
                 return None
-            
+
             if offset + pub_key_len > len(data):
                 return None
-            
+
             public_key = data[offset:offset+pub_key_len]
             offset += pub_key_len
-            
+
             # Signing key
             sig_key_len = data[offset]
             offset += 1
-            
+
             if sig_key_len != 32:
                 return None
-            
+
             if offset + sig_key_len > len(data):
                 return None
-            
+
             signing_key = data[offset:offset+sig_key_len]
             offset += sig_key_len
-            
+
             # Timestamp
             if offset + 8 > len(data):
                 return None
-            
+
             timestamp_ms = int.from_bytes(data[offset:offset+8], byteorder='big')
             offset += 8
-            
+
             # Derive what we can
             peer_id_derived = public_key[:8].hex()
-            
+
             debug_println("[NOISE] Minimal format parsed")
             return {
                 'peerID': peer_id_derived,
@@ -1904,7 +1902,7 @@ class BitchatClient:
                                                   timestamp: int, signature: bytes, 
                                                   previous_peer_id: str = None) -> bytes:
         """Encode noise identity announcement to TLV binary format matching Android/iOS.
-        
+
         TLV format (from Android IdentityAnnouncement):
           0x01 [len] [nickname_utf8]
           0x02 [len] [noise_public_key]  (X25519, 32 bytes)
@@ -3097,7 +3095,7 @@ def pad_to_optimal_block_size(data: bytes) -> bytes:
 
 def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
     """Sign an encoded+padded packet with Ed25519, matching Android's signPacketBeforeBroadcast.
-    
+
     Android signing process:
     1. Create signing version: TTL=0, signature=null
     2. Encode with BinaryProtocol.encode (includes padding)
@@ -3112,7 +3110,7 @@ def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
         packet = BinaryProtocol.decode(packet_bytes)
     if packet is None:
         return packet_bytes  # Can't decode, return as-is
-    
+
     # Create signing data (TTL=0, no signature) - matches Android toBinaryDataForSigning()
     signing_packet = BitchatPacket(
         version=packet.version,
@@ -3127,10 +3125,10 @@ def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
     )
     signing_encoded = BinaryProtocol.encode(signing_packet)
     signing_padded = pad_to_optimal_block_size(signing_encoded)
-    
+
     # Sign with Ed25519 (produces 64-byte signature)
     ed25519_signature = encryption_service.sign_data(signing_padded)
-    
+
     # Create final packet with signature
     signed_packet = BitchatPacket(
         version=packet.version,
@@ -3145,7 +3143,7 @@ def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
     )
     final_encoded = BinaryProtocol.encode(signed_packet)
     final_padded = pad_to_optimal_block_size(final_encoded)
-    
+
     debug_full_println(f"[SIGN] Signed packet type={packet.msg_type.name}, sig={ed25519_signature[:8].hex()}...")
     return final_padded
 
@@ -3155,12 +3153,12 @@ def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
     result = BinaryProtocol.decode(data)
     if result is not None:
         return result
-    
+
     # Second try: unpad and decode (fallback)
     unpadded = unpad_packet(data)
     if unpadded != data:  # Only if unpadding actually changed something
         return BinaryProtocol.decode(unpadded)
-    
+
     return None
 
 def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
@@ -3298,14 +3296,14 @@ def create_bitchat_packet_with_recipient(sender_id: str, recipient_id: Optional[
 
     # Encode packet
     encoded = BinaryProtocol.encode(packet)
-    
+
     # Pad to optimal block size matching Android's MessagePadding exactly
     encoded = pad_to_optimal_block_size(encoded)
-    
+
     # Add hex logging to match iOS format
     hex_string = ' '.join(f'{b:02X}' for b in encoded)
     debug_full_println(f"[RAW SEND] {hex_string}")
-    
+
     return encoded
 
 def create_bitchat_message_payload_full(sender: str, content: str, channel: Optional[str],
