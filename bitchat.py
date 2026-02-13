@@ -762,6 +762,8 @@ class BitchatClient:
         """Relay a packet if TTL > 1 (shared relay logic for all packet types)."""
         if packet.ttl <= 1:
             return
+        if self._is_packet_seen(packet):
+            return
         await asyncio.sleep(random.uniform(0.01, 0.05))
         relay_data = bytearray(raw_data)
         relay_data[2] = packet.ttl - 1
