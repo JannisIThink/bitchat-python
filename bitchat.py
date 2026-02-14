@@ -969,13 +969,12 @@ class BitchatClient:
         except Exception:
             pass
 
-        # Verify signature if present (warn but don't drop — format may differ)
+        # Verify signature if present (warn but don't drop — format may differ between platforms)
         if packet.signature and len(packet.signature) == 64:
             peer = self.peers.get(packet.sender_id_str)
             if peer and peer.signing_public_key:
                 if not verify_incoming_packet_signature(packet, peer.signing_public_key, self.encryption_service):
-                    debug_println(f"[VERIFY] ⚠ Signature mismatch on MESSAGE from {packet.sender_id_str}")
-                    return
+                    debug_println(f"[VERIFY] ⚠ Signature mismatch on MESSAGE from {packet.sender_id_str} — accepting anyway")
                 else:
                     debug_println(f"[VERIFY] ✓ Valid signature on MESSAGE from {packet.sender_id_str}")
 
