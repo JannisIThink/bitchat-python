@@ -45,12 +45,12 @@ class AppStateEncoder(json.JSONEncoder):
 def load_state() -> AppState:
     """Load app state from disk"""
     path = get_state_file_path()
-    
+
     if path.exists():
         try:
             with open(path, 'r') as f:
                 data = json.load(f)
-                
+
                 # Convert lists back to sets
                 if 'blocked_peers' in data:
                     data['blocked_peers'] = set(data['blocked_peers'])
@@ -58,7 +58,7 @@ def load_state() -> AppState:
                     data['password_protected_channels'] = set(data['password_protected_channels'])
                 if 'favorites' in data:
                     data['favorites'] = set(data['favorites'])
-                
+
                 # Convert encrypted passwords
                 if 'encrypted_channel_passwords' in data:
                     encrypted_passwords = {}
@@ -68,14 +68,14 @@ def load_state() -> AppState:
                             ciphertext=enc_data['ciphertext']
                         )
                     data['encrypted_channel_passwords'] = encrypted_passwords
-                
+
                 state = AppState(**data)
         except Exception as e:
             print(f"Warning: Could not parse state file: {e}")
             state = AppState()
     else:
         state = AppState()
-    
+
     # Generate identity key if not present
     if state.identity_key is None:
         signing_key = ed25519.Ed25519PrivateKey.generate()
@@ -85,13 +85,13 @@ def load_state() -> AppState:
             encryption_algorithm=serialization.NoEncryption()
         ))
         save_state(state)
-    
+
     return state
 
 def save_state(state: AppState) -> None:
     """Save app state to disk"""
     path = get_state_file_path()
-    
+
     # Convert to dict for JSON serialization
     data = {
         'nickname': state.nickname,
@@ -107,7 +107,7 @@ def save_state(state: AppState) -> None:
             for channel, ep in state.encrypted_channel_passwords.items()
         }
     }
-    
+
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
 
@@ -122,11 +122,11 @@ def encrypt_password(password: str, identity_key: List[int]) -> EncryptedPasswor
     """Encrypt a password using the identity key"""
     identity_key_bytes = bytes(identity_key)
     key = derive_encryption_key(identity_key_bytes)
-    
+
     aesgcm = AESGCM(key)
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, password.encode(), None)
-    
+
     return EncryptedPassword(
         nonce=list(nonce),
         ciphertext=list(ciphertext)
@@ -136,11 +136,11 @@ def decrypt_password(encrypted: EncryptedPassword, identity_key: List[int]) -> s
     """Decrypt a password using the identity key"""
     identity_key_bytes = bytes(identity_key)
     key = derive_encryption_key(identity_key_bytes)
-    
+
     aesgcm = AESGCM(key)
     nonce = bytes(encrypted.nonce)
     ciphertext = bytes(encrypted.ciphertext)
-    
+
     plaintext = aesgcm.decrypt(nonce, ciphertext, None)
     return plaintext.decode()
 

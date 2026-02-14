@@ -1489,7 +1489,7 @@ class BitchatClient:
 
     def _try_parse_ios_format(self, data: bytes) -> Optional[dict]:
         """Try iOS format: flags | peerID(8) | pubKeyLen | pubKey | sigKeyLen | sigKey | nicknameLen | nickname | timestamp | ...
-"""
+        """
         try:
             offset = 0
 
