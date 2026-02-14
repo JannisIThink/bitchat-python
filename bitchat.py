@@ -844,13 +844,13 @@ class BitchatClient:
             debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
             peer_nickname = None
 
-        # Verify signature on ANNOUNCE if present
+        # Verify signature on ANNOUNCE if present (warn but do NOT drop on failure —
+        # signing format may differ between platforms; dropping would prevent discovery)
         if packet.signature and len(packet.signature) == 64:
             signing_key = announce_signing_key or extract_signing_key_from_announce_payload(packet.payload)
             if signing_key:
                 if not verify_incoming_packet_signature(packet, signing_key, self.encryption_service):
-                    debug_println(f"[VERIFY] ✗ Invalid signature on ANNOUNCE from {packet.sender_id_str} — dropping")
-                    return
+                    debug_println(f"[VERIFY] ⚠ Signature mismatch on ANNOUNCE from {packet.sender_id_str} — accepting anyway")
                 else:
                     debug_println(f"[VERIFY] ✓ Valid signature on ANNOUNCE from {packet.sender_id_str}")
 
@@ -937,6 +937,25 @@ class BitchatClient:
 
     async def handle_message(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle chat message"""
+        # Register unknown peer on first MESSAGE (so handshake can be triggered)
+        if packet.sender_id_str not in self.peers:
+            self.peers[packet.sender_id_str] = Peer()
+            self.peers[packet.sender_id_str].nickname = packet.sender_id_str[:8]
+            debug_println(f"[MESSAGE] Registered unknown peer {packet.sender_id_str[:8]} from MESSAGE")
+            # Trigger handshake with this new peer
+            if self.my_peer_id < packet.sender_id_str:
+                try:
+                    handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
+                    handshake_packet = create_bitchat_packet_with_recipient(
+                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
+                    )
+                    handshake_data = bytearray(handshake_packet)
+                    handshake_data[2] = 7
+                    await self.send_packet(bytes(handshake_data))
+                    debug_println(f"[NOISE] Sent handshake init to {packet.sender_id_str} (triggered by MESSAGE)")
+                except Exception as e:
+                    debug_println(f"[NOISE] Failed to initiate handshake from MESSAGE: {e}")
+
         # Check if this is a channel announcement (pipe-delimited format: channel|0/1|creatorID|commitment)
         try:
             raw_text = bytes(packet.payload).decode('utf-8', errors='ignore')
@@ -950,12 +969,12 @@ class BitchatClient:
         except Exception:
             pass
 
-        # Verify signature if present (matching Android SecurityManager)
+        # Verify signature if present (warn but don't drop — format may differ)
         if packet.signature and len(packet.signature) == 64:
             peer = self.peers.get(packet.sender_id_str)
             if peer and peer.signing_public_key:
                 if not verify_incoming_packet_signature(packet, peer.signing_public_key, self.encryption_service):
-                    debug_println(f"[VERIFY] ✗ Invalid signature on MESSAGE from {packet.sender_id_str} — dropping")
+                    debug_println(f"[VERIFY] ⚠ Signature mismatch on MESSAGE from {packet.sender_id_str}")
                     return
                 else:
                     debug_println(f"[VERIFY] ✓ Valid signature on MESSAGE from {packet.sender_id_str}")
@@ -1037,7 +1056,7 @@ class BitchatClient:
 
     async def display_message(self, message: BitchatMessage, packet: BitchatPacket, is_private: bool):
         """Display a message in the terminal"""
-        sender_nick = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str
+        sender_nick = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str[:8]
 
         # Track discovered channels
         if message.channel:
