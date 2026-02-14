@@ -42,7 +42,7 @@ OFFSET_TIMESTAMP = 3
 OFFSET_FLAGS = 11
 OFFSET_PAYLOAD_LENGTH = 12
 
-
+# Message types per BitChat specification (8 types only)
 class MessageType(IntEnum):
     ANNOUNCE = 0x01
     MESSAGE = 0x02
@@ -53,7 +53,7 @@ class MessageType(IntEnum):
     REQUEST_SYNC = 0x21
     FILE_TRANSFER = 0x22
 
-
+# Noise Protocol payload types (for decrypted noiseEncrypted payloads)
 class NoisePayloadType(IntEnum):
     PRIVATE_MESSAGE = 0x01
     READ_RECEIPT = 0x02

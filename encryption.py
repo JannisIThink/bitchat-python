@@ -578,14 +578,31 @@ class NoiseSession:
     receive_cipher: NoiseCipherState
     remote_static_key: X25519PublicKey
     established_time: float
+    message_count: int = 0  # Track messages for rekeying (Android rekeys after 1000)
+    REKEY_THRESHOLD: int = 1000
+
+    # Callback set by EncryptionService – called when rekey is needed
+    on_rekey_needed: Optional[Callable[[str], None]] = None
 
     def encrypt(self, plaintext: bytes) -> bytes:
         """Encrypt data for transport"""
-        return self.send_cipher.encrypt(plaintext)
+        result = self.send_cipher.encrypt(plaintext)
+        self.message_count += 1
+        self._check_rekey()
+        return result
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         """Decrypt received data"""
-        return self.receive_cipher.decrypt(ciphertext)
+        result = self.receive_cipher.decrypt(ciphertext)
+        self.message_count += 1
+        self._check_rekey()
+        return result
+
+    def _check_rekey(self):
+        """Check if session needs rekeying (matching Android: 1000 messages)"""
+        if self.message_count == self.REKEY_THRESHOLD:
+            if self.on_rekey_needed:
+                self.on_rekey_needed(self.peer_id)
 
     def get_fingerprint(self) -> str:
         """Get peer's public key fingerprint"""
@@ -621,6 +638,7 @@ class EncryptionService:
         # Callbacks
         self.on_peer_authenticated: Optional[Callable[[str, str], None]] = None
         self.on_handshake_required: Optional[Callable[[str], None]] = None
+        self.on_rekey_needed: Optional[Callable[[str], None]] = None  # Called when session needs rekeying (>1000 msgs)
 
     def _load_or_create_identity(self, identity_path: Optional[str]) -> X25519PrivateKey:
         """Load existing identity or create new one"""
@@ -784,6 +802,7 @@ class EncryptionService:
                         remote_static_key=remote_key,
                         established_time=time.time()
                     )
+                    session.on_rekey_needed = self._handle_rekey_needed
                     self.sessions[peer_id] = session
 
                     # Cleanup handshake state
@@ -848,6 +867,13 @@ class EncryptionService:
         if peer_id in self.sessions:
             return self.sessions[peer_id].get_fingerprint()
         return None
+
+    def _handle_rekey_needed(self, peer_id: str):
+        """Internal handler when a session exceeds 1000 messages – triggers rekey"""
+        # Remove old session so the next encrypt/decrypt forces a new handshake
+        self.remove_session(peer_id)
+        if self.on_rekey_needed:
+            self.on_rekey_needed(peer_id)
 
     def sign_data(self, data: bytes) -> bytes:
         """Sign data with our Ed25519 signing key (64-byte signature)"""

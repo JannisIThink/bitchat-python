@@ -10,6 +10,7 @@ import hashlib
 import random
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Set
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import IntEnum
 import logging
@@ -21,8 +22,6 @@ import aioconsole
 from pybloom_live import BloomFilter
 
 from encryption import EncryptionService, NoiseError
-#from compression import compress_if_beneficial, decompress
-#from fragmentation import FragmentPayload, create_fragments, FRAGMENT_SIZE_THRESHOLD
 from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
@@ -81,26 +80,7 @@ def debug_full_println(*args, **kwargs):
             # Silently ignore blocking errors in debug output
             pass
 
-# Message types per BitChat specification (8 types only)
-class MessageType(IntEnum):
-    ANNOUNCE = 0x01
-    MESSAGE = 0x02
-    LEAVE = 0x03
-    NOISE_HANDSHAKE = 0x10
-    NOISE_ENCRYPTED = 0x11
-    FRAGMENT = 0x20
-    REQUEST_SYNC = 0x21
-    FILE_TRANSFER = 0x22
 
-# Noise Protocol payload types (for decrypted noiseEncrypted payloads)
-class NoisePayloadType(IntEnum):
-    PRIVATE_MESSAGE = 0x01
-    READ_RECEIPT = 0x02
-    DELIVERED = 0x03
-    VERIFY_CHALLENGE = 0x10
-    VERIFY_RESPONSE = 0x11
-
-@dataclass
 @dataclass
 class Peer:
     peer_id: str = ""  # 16 hex chars from Noise public key fingerprint
@@ -139,6 +119,10 @@ class DeliveryTracker:
 
     def mark_delivered(self, message_id: str) -> bool:
         return self.pending_messages.pop(message_id, None) is not None
+
+    def confirm_delivery(self, message_id: str) -> bool:
+        """Alias for mark_delivered – called when a DELIVERED ACK is received"""
+        return self.mark_delivered(message_id)
 
     def should_send_ack(self, ack_id: str) -> bool:
         if ack_id in self.sent_acks:
@@ -215,11 +199,11 @@ class BitchatClient:
     def __init__(self,fromLoRa = None,toLoRa = None):
         self.fromLoRa = fromLoRa
         self.toLoRa = toLoRa
-        self.my_peer_id = os.urandom(8).hex()
         self.nickname = "LoRa-Bridge"
         self.peers: Dict[str, Peer] = {}
-        self.bloom = BloomFilter(capacity=500, error_rate=0.01)
-        self.processed_messages: Set[str] = set()  # Backup for message IDs
+        self.bloom = BloomFilter(capacity=10000, error_rate=0.01)
+        self.processed_messages: OrderedDict[str, float] = OrderedDict()  # message_id -> timestamp, max 10000 (matching Android)
+        self.MAX_DEDUP_ENTRIES = 10000  # Matching Android SecurityManager
         self.fragment_collector = FragmentCollector()
         self.delivery_tracker = DeliveryTracker()
         self.chat_context = ChatContext()
@@ -231,6 +215,8 @@ class BitchatClient:
         self.channel_key_commitments: Dict[str, str] = {}
         self.discovered_channels: Set[str] = set()
         self.encryption_service = EncryptionService()
+        # Derive peer ID from Noise public key fingerprint (matching Android: first 8 bytes of SHA256)
+        self.my_peer_id = self.encryption_service.get_identity_fingerprint()[:16]
         self.client: Optional[BleakClient] = None
         self.characteristic: Optional[BleakGATTCharacteristic] = None
         self.running = True
@@ -257,6 +243,16 @@ class BitchatClient:
         # Setup encryption service callbacks for better handshake handling
         self.encryption_service.on_peer_authenticated = self._on_peer_authenticated
         self.encryption_service.on_handshake_required = self._on_handshake_required
+        self.encryption_service.on_rekey_needed = self._on_rekey_needed
+
+    def _add_to_processed(self, message_id: str):
+        """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
+        if message_id in self.processed_messages:
+            return
+        # Evict oldest entries if at capacity
+        while len(self.processed_messages) >= self.MAX_DEDUP_ENTRIES:
+            self.processed_messages.popitem(last=False)  # Remove oldest (FIFO)
+        self.processed_messages[message_id] = time.time()
 
     def _on_peer_authenticated(self, peer_id: str, fingerprint: str):
         """Callback when a peer is authenticated via Noise protocol"""
@@ -269,6 +265,25 @@ class BitchatClient:
         """Callback when handshake is required for a peer"""
         debug_println(f"[NOISE] Handshake required for peer {peer_id}")
         # The handshake will be initiated when trying to send private messages
+
+    def _on_rekey_needed(self, peer_id: str):
+        """Callback when session needs rekeying after 1000 messages (matching Android)"""
+        debug_println(f"[NOISE] Rekeying needed for peer {peer_id} (>1000 messages)")
+        peer_nick = self.peers.get(peer_id, Peer()).nickname or peer_id[:8]
+        print(f"\r\033[K\033[93m🔑 Re-establishing secure session with {peer_nick} (rekey)...\033[0m")
+        print("> ", end='', flush=True)
+        # Initiate new handshake using tie-breaker logic (same as initial connection)
+        if self.my_peer_id < peer_id:
+            try:
+                handshake_message = self.encryption_service.initiate_handshake(peer_id)
+                handshake_packet = create_bitchat_packet_with_recipient(
+                    self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
+                )
+                handshake_data = bytearray(handshake_packet)
+                handshake_data[2] = 7  # TTL
+                asyncio.create_task(self.send_packet(bytes(handshake_data)))
+            except Exception as e:
+                debug_println(f"[NOISE] Failed to initiate rekey handshake: {e}")
 
     async def send_pending_private_messages(self, peer_id: str):
         """Send all pending private messages for a peer after handshake completes"""
@@ -932,6 +947,19 @@ class BitchatClient:
 
     async def handle_message(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle chat message"""
+        # Check if this is a channel announcement (pipe-delimited format: channel|0/1|creatorID|commitment)
+        try:
+            raw_text = bytes(packet.payload).decode('utf-8', errors='ignore')
+            if '|' in raw_text:
+                parts = raw_text.split('|')
+                if len(parts) >= 3 and parts[1] in ('0', '1'):
+                    # Looks like a channel announce – delegate
+                    await self.handle_channel_announce(packet)
+                    await self._relay_packet(packet, raw_data, noRelay)
+                    return
+        except Exception:
+            pass
+
         # Verify signature if present (matching Android SecurityManager)
         if packet.signature and len(packet.signature) == 64:
             peer = self.peers.get(packet.sender_id_str)
@@ -995,11 +1023,11 @@ class BitchatClient:
                 return
 
         try:
-            # Check for duplicates using both bloom filter and set
+            # Check for duplicates using both bloom filter and ordered dict (max 10000, matching Android)
             if message.id not in self.processed_messages:
-                # Add to bloom filter and set
+                # Add to bloom filter and ordered dict with eviction
                 self.bloom.add(message.id)
-                self.processed_messages.add(message.id)
+                self._add_to_processed(message.id)
 
                 # Display the message
                 await self.display_message(message, packet, is_private_message)
@@ -1117,8 +1145,26 @@ class BitchatClient:
             await self._relay_packet(packet, raw_data, noRelay)
             return
 
-        # Check payload size 
+        # Race condition guard (matching Android tie-breaker logic):
+        # If we already have an in-progress handshake as INITIATOR with this peer,
+        # and we receive a new handshake init (32 bytes = just ephemeral key),
+        # the side with the lower peer ID wins as initiator.
+        sender = packet.sender_id_str
         payload_size = len(packet.payload)
+        is_init_message = payload_size == 32  # First message in XX pattern is just "e" (32 bytes)
+        if is_init_message and sender in self.encryption_service.handshake_states:
+            existing_hs = self.encryption_service.handshake_states[sender]
+            from encryption import NoiseRole
+            if existing_hs.role == NoiseRole.INITIATOR:
+                if self.my_peer_id < sender:
+                    # We have lower ID → we are the rightful initiator → ignore their init
+                    debug_println(f"[NOISE] Race condition: ignoring handshake init from {sender} (we have lower ID, we are initiator)")
+                    return
+                else:
+                    # They have lower ID → they should be initiator → drop our state, accept theirs
+                    debug_println(f"[NOISE] Race condition: dropping our initiator state for {sender} (they have lower ID)")
+                    self.encryption_service.clear_handshake_state(sender)
+
         debug_println(f"[NOISE] Handshake payload size: {payload_size} bytes")
         debug_println(f"[NOISE] Handshake payload hex (full): {packet.payload.hex()}")
 
@@ -1232,7 +1278,7 @@ class BitchatClient:
                         # Check for duplicates
                         if message_id not in self.processed_messages:
                             self.bloom.add(message_id)
-                            self.processed_messages.add(message_id)
+                            self._add_to_processed(message_id)
 
                             # Get sender nickname
                             sender_nick = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str[:8]
@@ -1363,92 +1409,6 @@ class BitchatClient:
 
             self.chat_context.add_channel(channel)
             await self.save_app_state()
-
-    async def handle_noise_identity_announce(self, packet: BitchatPacket):
-        """Handle Noise identity announcement"""
-        try:
-            sender_id = packet.sender_id_str
-            debug_println(f"[NOISE] Received identity announcement from {sender_id}")
-
-            # Skip if it's from ourselves
-            if sender_id == self.my_peer_id:
-                return
-
-            # Try to decode the identity announcement
-            announcement = None
-
-            # First try binary format, then JSON fallback
-            try:
-                announcement = self.parse_noise_identity_announcement_binary(packet.payload)
-            except Exception as be:
-                debug_println(f"[NOISE] Binary decode failed: {be}")
-                # Try JSON fallback for compatibility
-                try:
-                    announcement_data = json.loads(packet.payload.decode('utf-8'))
-                    announcement = {
-                        'peerID': announcement_data.get('peerID', sender_id),
-                        'nickname': announcement_data.get('nickname', 'Unknown'),
-                        'publicKey': announcement_data.get('publicKey', ''),
-                        'signingPublicKey': announcement_data.get('signingPublicKey', ''),
-                        'timestamp': announcement_data.get('timestamp', 0),
-                        'signature': announcement_data.get('signature', '')
-                    }
-                except Exception as je:
-                    debug_println(f"[NOISE] JSON decode also failed: {je}")
-                    debug_println(f"[NOISE] Raw payload (first 32 bytes): {packet.payload[:32].hex()}")
-                    return
-
-            if not announcement:
-                debug_println(f"[NOISE] Failed to decode identity announcement from {sender_id}")
-                return
-
-            peer_id = announcement['peerID']
-            nickname = announcement['nickname']
-
-            debug_println(f"[NOISE] Identity announcement: {peer_id} -> {nickname}")
-
-            # Check if this is a new peer
-            is_new_peer = peer_id not in self.peers
-
-            # Update peer info
-            if peer_id not in self.peers:
-                self.peers[peer_id] = Peer()
-            self.peers[peer_id].nickname = nickname
-
-            # Store signing public key if available
-            signing_key_hex = announcement.get('signingPublicKey', '')
-            if signing_key_hex and len(signing_key_hex) == 64:  # 32 bytes = 64 hex chars
-                self.peers[peer_id].signing_public_key = bytes.fromhex(signing_key_hex)
-
-            if is_new_peer:
-                print(f"\r\033[K\033[33m{nickname} connected\033[0m\n> ", end='', flush=True)
-                debug_println(f"[<-- RECV] Announce: Peer {peer_id} is now known as '{nickname}'")
-
-            # Check if we should initiate handshake (lexicographic comparison)
-            if self.my_peer_id < peer_id:
-                debug_println(f"[NOISE] We should initiate handshake with {peer_id}")
-                # Check if we already have a session or ongoing handshake
-                if not self.encryption_service.is_session_established(peer_id):
-                    try:
-                        handshake_message = self.encryption_service.initiate_handshake(peer_id)
-                        handshake_packet = create_bitchat_packet_with_recipient(
-                            self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
-                        )
-                        # Set TTL to 7 like Android
-                        handshake_data = bytearray(handshake_packet)
-                        handshake_data[2] = 7
-                        handshake_packet = bytes(handshake_data)
-                        await self.send_packet(handshake_packet)
-                        debug_println(f"[NOISE] Initiated handshake with {peer_id}")
-                    except Exception as e:
-                        debug_println(f"[NOISE] Failed to initiate handshake: {e}")
-            else:
-                debug_println(f"[NOISE] Waiting for {peer_id} to initiate handshake")
-
-        except Exception as e:
-            debug_println(f"[NOISE] Error handling identity announcement: {e}")
-            import traceback
-            debug_println(f"[NOISE] Identity announce error details: {traceback.format_exc()}")
 
     def parse_noise_identity_announcement_binary(self, data: bytes) -> dict:
         """Parse binary format noise identity announcement - handles both iOS and Android formats"""
@@ -1848,11 +1808,11 @@ class BitchatClient:
             debug_println(f"[ACK] Skipping delivery ACK for {message_id} — no Noise session with {sender_id}")
 
     async def send_channel_announce(self, channel: str, is_protected: bool, key_commitment: Optional[str]):
-        """Send channel announcement"""
+        """Send channel announcement (matching Android: uses MESSAGE type with channel info)"""
         payload = f"{channel}|{'1' if is_protected else '0'}|{self.my_peer_id}|{key_commitment or ''}"
         packet = create_bitchat_packet(
             self.my_peer_id,
-            MessageType.ANNOUNCE,
+            MessageType.MESSAGE,
             payload.encode()
         )
 
@@ -2892,13 +2852,17 @@ class BitchatClient:
     async def fromLoraLoop(self):
         while self.running:
             try:
-                if self.fromLoRa != None:
+                if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
-                    package = self.fromLoRa.get()
-                    print("Got:",parse_bitchat_packet(package))
-                    await self.notification_handler(None,package,True)
+                    try:
+                        package = self.fromLoRa.get_nowait()
+                        print("Got:",parse_bitchat_packet(package))
+                        await self.notification_handler(None,package,True)
+                    except Exception:
+                        # Queue empty — yield to event loop briefly
+                        await asyncio.sleep(0.05)
                 else:
-                    time.sleep(600)
+                    await asyncio.sleep(600) # Sleep to avoid busy loop if fromLoRa is not set
             except KeyboardInterrupt:
                 self.running = False
                 break
