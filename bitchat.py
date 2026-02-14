@@ -799,7 +799,7 @@ class BitchatClient:
             except Exception:
                 pass
         await self.send_packet(relay_bytes, via_lora=False)
-        
+
         if (self.toLoRa is not None) and (not noRelay):
             relay_data = bytearray(raw_data) # Transmit without decremented TTL, bc TTL wie be reduced by receiver's relay logic
             relay_bytes = bytes(relay_data)
@@ -831,52 +831,42 @@ class BitchatClient:
         peer_nickname = None
         announce_signing_key = None
 
-        # Check if this is a Noise Identity Announcement (has signature) or simple text announce
-        if packet.signature:
-            # Parse as Noise Identity Announcement binary format
-            try:
-                result = self.parse_noise_identity_announcement_binary(packet.payload)
-                if result and isinstance(result, dict):
-                    peer_nickname = result.get('nickname', None)
-                    # Extract signing key for storage
-                    spk_hex = result.get('signingPublicKey', '')
-                    if spk_hex and len(spk_hex) == 64:
-                        announce_signing_key = bytes.fromhex(spk_hex)
-            except Exception as e:
-                debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
-                peer_nickname = None
+        # Always try TLV/binary parsing first (works for both signed and unsigned announces)
+        try:
+            result = self.parse_noise_identity_announcement_binary(packet.payload)
+            if result and isinstance(result, dict):
+                peer_nickname = result.get('nickname', None) or None  # Treat empty string as None
+                # Extract signing key for storage
+                spk_hex = result.get('signingPublicKey', '')
+                if spk_hex and len(spk_hex) == 64:
+                    announce_signing_key = bytes.fromhex(spk_hex)
+        except Exception as e:
+            debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
+            peer_nickname = None
 
-            # Verify signature on ANNOUNCE — extract signing key from payload (like Android)
-            if packet.signature and len(packet.signature) == 64:
-                signing_key = announce_signing_key or extract_signing_key_from_announce_payload(packet.payload)
-                if signing_key:
-                    if not verify_incoming_packet_signature(packet, signing_key, self.encryption_service):
-                        debug_println(f"[VERIFY] ✗ Invalid signature on ANNOUNCE from {packet.sender_id_str} — dropping")
-                        return
-                    else:
-                        debug_println(f"[VERIFY] ✓ Valid signature on ANNOUNCE from {packet.sender_id_str}")
-
-        # Fallback to text decoding if we don't have a nickname yet
-        if not peer_nickname:
-            # Extract just the text part, skip binary  data
-            # Try to find readable ASCII text in the payload
-            text_parts = []
-            current_text = bytearray()
-            for byte in packet.payload:
-                if 32 <= byte <= 126:  # Printable ASCII
-                    current_text.append(byte)
+        # Verify signature on ANNOUNCE if present
+        if packet.signature and len(packet.signature) == 64:
+            signing_key = announce_signing_key or extract_signing_key_from_announce_payload(packet.payload)
+            if signing_key:
+                if not verify_incoming_packet_signature(packet, signing_key, self.encryption_service):
+                    debug_println(f"[VERIFY] ✗ Invalid signature on ANNOUNCE from {packet.sender_id_str} — dropping")
+                    return
                 else:
-                    if current_text:
-                        text_parts.append(current_text.decode('utf-8', errors='ignore').strip())
-                        current_text = bytearray()
-            if current_text:
-                text_parts.append(current_text.decode('utf-8', errors='ignore').strip())
+                    debug_println(f"[VERIFY] ✓ Valid signature on ANNOUNCE from {packet.sender_id_str}")
 
-            # Get the longest text part as nickname
-            if text_parts:
-                peer_nickname = max(text_parts, key=len)
-            else:
-                peer_nickname = packet.sender_id_str[:8]
+        # Fallback: try plain text decoding (simple text announce without binary/TLV)
+        if not peer_nickname:
+            try:
+                # Try decoding entire payload as UTF-8 text (simple announce: just nickname bytes)
+                text = packet.payload.decode('utf-8').strip()
+                if text and len(text) <= 50 and text.isprintable():
+                    peer_nickname = text
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+        # Last resort: use peer ID prefix
+        if not peer_nickname:
+            peer_nickname = packet.sender_id_str[:8]
 
         is_new_peer = packet.sender_id_str not in self.peers
 
@@ -1418,6 +1408,12 @@ class BitchatClient:
 
             # Try multiple parsing strategies to handle iOS and Android formats
 
+            # Strategy 0: TLV format (0x01=nickname, 0x02=noiseKey, 0x03=signingKey) — matches encode_noise_identity_announcement_binary
+            result = self._try_parse_tlv_format(data)
+            if result:
+                debug_println("[NOISE] Successfully parsed with TLV format")
+                return result
+
             # Strategy 1: iOS format - flags | peerID(8) | pubKeyLen | pubKey(32) | sigKeyLen | sigKey(32) | nicknameLen | nickname | timestamp | ...
             result = self._try_parse_ios_format(data)
             if result:
@@ -1443,6 +1439,65 @@ class BitchatClient:
             debug_println(f"[NOISE] Error parsing binary announcement: {e}")
             import traceback
             debug_println(f"[NOISE] Binary parser error details: {traceback.format_exc()}")
+            return None
+
+    def _try_parse_tlv_format(self, data: bytes) -> Optional[dict]:
+        """Parse TLV format used by Android and our own encode_noise_identity_announcement_binary.
+        Format: [type(1)][length(1)][value(length)] repeated.
+        Type 0x01 = nickname, 0x02 = Noise public key, 0x03 = signing public key.
+        """
+        try:
+            if len(data) < 4:  # At least one TLV entry
+                return None
+
+            # Check if first byte is a valid TLV type marker
+            if data[0] not in (0x01, 0x02, 0x03):
+                return None
+
+            nickname = ''
+            public_key = b''
+            signing_key = b''
+            offset = 0
+
+            while offset + 2 <= len(data):
+                tlv_type = data[offset]
+                tlv_len = data[offset + 1]
+                offset += 2
+
+                if tlv_type not in (0x01, 0x02, 0x03):
+                    break  # Unknown type, stop parsing
+
+                if offset + tlv_len > len(data):
+                    break  # Truncated
+
+                tlv_value = data[offset:offset + tlv_len]
+                offset += tlv_len
+
+                if tlv_type == 0x01:
+                    nickname = tlv_value.decode('utf-8', errors='ignore')
+                elif tlv_type == 0x02:
+                    public_key = tlv_value
+                elif tlv_type == 0x03:
+                    signing_key = tlv_value
+
+            # Need at least nickname or public key to be valid
+            if not public_key and not nickname:
+                return None
+
+            peer_id_derived = hashlib.sha256(public_key).hexdigest()[:16] if public_key else ''
+
+            debug_println(f"[NOISE] TLV parsed: nickname='{nickname}', pubKey={len(public_key)}B, sigKey={len(signing_key)}B")
+            return {
+                'peerID': peer_id_derived,
+                'publicKey': public_key.hex() if public_key else '',
+                'signingPublicKey': signing_key.hex() if signing_key else '',
+                'nickname': nickname,
+                'timestamp': 0,
+                'signature': '',
+                'previousPeerID': None,
+                'truncated': False
+            }
+        except Exception:
             return None
 
     def _try_parse_ios_format(self, data: bytes) -> Optional[dict]:
@@ -2221,16 +2276,22 @@ class BitchatClient:
         target_nickname = parts[1]
         message = parts[2] if len(parts) > 2 else None
 
-        # Find peer
+        # Find peer by nickname or peer ID
         target_peer_id = None
         for peer_id, peer in self.peers.items():
-            if peer.nickname == target_nickname:
+            if peer.nickname and peer.nickname.lower() == target_nickname.lower():
                 target_peer_id = peer_id
+                target_nickname = peer.nickname  # Use canonical casing
+                break
+            if peer_id.lower().startswith(target_nickname.lower()):
+                target_peer_id = peer_id
+                target_nickname = peer.nickname or peer_id[:8]
                 break
 
         if not target_peer_id:
             print(f"\033[93m⚠ User '{target_nickname}' not found\033[0m")
             print("\033[90mThey may be offline or using a different nickname.\033[0m")
+            print("\033[90mUse /online to see available peers.\033[0m")
             return
 
         if message:
