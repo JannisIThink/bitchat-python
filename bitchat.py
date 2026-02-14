@@ -2039,18 +2039,18 @@ class BitchatClient:
             pending_messages = sum(len(msgs) for msgs in self.pending_private_messages.values())
 
             print("\n╭─── Connection Status ──────╮")
-            print(f"│ Status: {connection_status:^18}│")
+            print(f"│ Status: {connection_status:^18} │")
             print(f"│ Peers connected: {peer_count:6}    │")
             print(f"│ Active channels: {channel_count:6}    │")
-            print(f"│ Active DMs:      {dm_count:6}     │")
+            print(f"│ Active DMs:      {dm_count:6}    │")
             print("│                            │")
             print(f"│ Secure sessions: {session_count:6}    │")
             print(f"│ Pending handshakes: {pending_handshakes:3}    │")
             print(f"│ Queued messages: {pending_messages:6}    │")
             print("│                            │")
             print(f"│ Your nickname: {self.nickname[:11]:^11} │")
-            print(f"│ Your ID: {self.my_peer_id[:8]}...      │")
-            print("╰───────────────────────────╯")
+            print(f"│ Your ID: {self.my_peer_id[:8]}...       │")
+            print("╰────────────────────────────╯")
 
             # Show encryption session details if any
             if session_count > 0:
