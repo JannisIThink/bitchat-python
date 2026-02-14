@@ -15,16 +15,18 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 import logging
 import multiprocessing
+import traceback
 
 from bleak import BleakClient, BleakScanner, BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 import aioconsole
 from pybloom_live import BloomFilter
 
-from encryption import EncryptionService, NoiseError
+from encryption import EncryptionService, NoiseError, NoiseRole
 from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
+from persistence import get_state_file_path
 import threading
 
 # Version
@@ -214,7 +216,10 @@ class BitchatClient:
         self.password_protected_channels: Set[str] = set()
         self.channel_key_commitments: Dict[str, str] = {}
         self.discovered_channels: Set[str] = set()
-        self.encryption_service = EncryptionService()
+        # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
+        
+        _identity_path = str(get_state_file_path().parent / "noise_identity.key")
+        self.encryption_service = EncryptionService(identity_path=_identity_path)
         # Derive peer ID from Noise public key fingerprint (matching Android: first 8 bytes of SHA256)
         self.my_peer_id = self.encryption_service.get_identity_fingerprint()[:16]
         self.client: Optional[BleakClient] = None
@@ -502,7 +507,6 @@ class BitchatClient:
                 debug_println("[3] Sent Noise identity announcement (Ed25519 signed)")
             except Exception as e:
                 debug_println(f"[3] Failed to send identity announcement: {e}")
-                import traceback
                 debug_println(f"[3] Traceback: {traceback.format_exc()}")
                 # Fallback to old key exchange
                 handshake_message = self.encryption_service.initiate_handshake(self.my_peer_id)
@@ -1162,7 +1166,6 @@ class BitchatClient:
         is_init_message = payload_size == 32  # First message in XX pattern is just "e" (32 bytes)
         if is_init_message and sender in self.encryption_service.handshake_states:
             existing_hs = self.encryption_service.handshake_states[sender]
-            from encryption import NoiseRole
             if existing_hs.role == NoiseRole.INITIATOR:
                 if self.my_peer_id < sender:
                     # We have lower ID → we are the rightful initiator → ignore their init
@@ -1205,7 +1208,6 @@ class BitchatClient:
 
         except Exception as e:
             debug_println(f"[NOISE] Handshake failed with {packet.sender_id_str}: {e}")
-            import traceback
             debug_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
             debug_println(f"[NOISE] Payload breakdown:")
             debug_println(f"  - First 32 bytes (e): {packet.payload[:32].hex()}")
@@ -1455,7 +1457,6 @@ class BitchatClient:
 
         except Exception as e:
             debug_println(f"[NOISE] Error parsing binary announcement: {e}")
-            import traceback
             debug_println(f"[NOISE] Binary parser error details: {traceback.format_exc()}")
             return None
 
