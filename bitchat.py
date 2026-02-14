@@ -21,8 +21,8 @@ import aioconsole
 from pybloom_live import BloomFilter
 
 from encryption import EncryptionService, NoiseError
-from compression import compress_if_beneficial, decompress
-from fragmentation import FragmentPayload, create_fragments, FRAGMENT_SIZE_THRESHOLD
+#from compression import compress_if_beneficial, decompress
+#from fragmentation import FragmentPayload, create_fragments, FRAGMENT_SIZE_THRESHOLD
 from terminal_ux import ChatContext, ChatMode, Public, Channel, PrivateDM, format_message_display, print_help, clear_screen
 from persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
@@ -783,7 +783,10 @@ class BitchatClient:
             except Exception:
                 pass
         await self.send_packet(relay_bytes, via_lora=False)
-        if self.toLoRa is not None and not noRelay:
+        
+        if (self.toLoRa is not None) and (not noRelay):
+            relay_data = bytearray(raw_data) # Transmit without decremented TTL, bc TTL wie be reduced by receiver's relay logic
+            relay_bytes = bytes(relay_data)
             self.toLoRa.put(relay_bytes)
 
     async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
@@ -800,6 +803,7 @@ class BitchatClient:
             await self.handle_noise_encrypted(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.LEAVE:
             await self.handle_leave(packet, raw_data, noRelay)
+        #Handle and relay SyncRequest and File-Transfers, but don't handle them
         elif packet.msg_type == MessageType.REQUEST_SYNC:
             await self._relay_packet(packet, raw_data, noRelay)
         elif packet.msg_type == MessageType.FILE_TRANSFER:
@@ -958,6 +962,8 @@ class BitchatClient:
                 debug_println(f"[MESSAGE] Parsed as raw UTF-8 text: '{raw_text[:50]}'")
             except Exception as e2:
                 debug_full_println(f"[ERROR] Failed to parse message: {e}, fallback error: {e2}")
+                # Still relay even if we can't parse (matching Android: relay is independent of processing)
+                await self._relay_packet(packet, raw_data, noRelay)
                 return
 
         try:
@@ -974,8 +980,9 @@ class BitchatClient:
                 if should_send_ack(is_private_message, message.channel, None, self.nickname, len(self.peers)):
                     await self.send_delivery_ack(message.id, packet.sender_id_str, is_private_message)
 
-                # Relay if TTL > 1
-                await self._relay_packet(packet, raw_data, noRelay)
+                # Relay broadcasts only — Android skips relay for packets addressed to us
+                if is_broadcast:
+                    await self._relay_packet(packet, raw_data, noRelay)
             else:
                 debug_println(f"[DUPLICATE] Ignoring duplicate message: {message.id}")
 
@@ -1078,7 +1085,8 @@ class BitchatClient:
 
         # Check if this handshake is for us
         if packet.recipient_id_str and packet.recipient_id_str != self.my_peer_id:
-            debug_println(f"[NOISE] Handshake not for us, ignoring")
+            debug_println(f"[NOISE] Handshake not for us, relaying")
+            await self._relay_packet(packet, raw_data, noRelay)
             return
 
         # Check payload size 
@@ -1121,133 +1129,6 @@ class BitchatClient:
             debug_println(f"  - First 32 bytes (e): {packet.payload[:32].hex()}")
             if len(packet.payload) > 32:
                 debug_println(f"  - Remaining bytes ({len(packet.payload)-32}): {packet.payload[32:].hex()}")
-            # Clear any partial handshake state
-            self.encryption_service.clear_handshake_state(packet.sender_id_str)
-
-    async def handle_key_exchange(self, packet: BitchatPacket):
-        """Handle key exchange"""
-        try:
-            # Convert bytearray to bytes for encryption service
-            payload_bytes = bytes(packet.payload) if isinstance(packet.payload, bytearray) else packet.payload
-            response = self.encryption_service.process_handshake_message(packet.sender_id_str, payload_bytes)
-            if response:
-                response_packet = create_bitchat_packet(
-                    self.my_peer_id, MessageType.NOISE_HANDSHAKE, response
-                )
-                await self.send_packet(response_packet)
-
-            if self.encryption_service.is_session_established(packet.sender_id_str):
-                debug_println(f"[CRYPTO] Handshake completed with {packet.sender_id_str}")
-                # If this is a new peer after reconnection, send our key exchange too
-                if packet.sender_id_str not in self.peers:
-                    debug_println(f"[CRYPTO] Sending key exchange response to new peer {packet.sender_id_str}")
-                    handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
-                    key_exchange_packet = create_bitchat_packet(
-                        self.my_peer_id, MessageType.NOISE_HANDSHAKE, handshake_message
-                    )
-                    await self.send_packet(key_exchange_packet)
-
-        except Exception as e:
-            debug_println(f"[CRYPTO] Handshake failed with {packet.sender_id_str}: {e}")
-
-    async def handle_noise_handshake_init(self, packet: BitchatPacket):
-        """Handle Noise handshake initiation"""
-        debug_println(f"[NOISE] Received handshake init from {packet.sender_id_str}")
-        debug_println(f"[NOISE] Recipient ID: {packet.recipient_id_str}, My ID: {self.my_peer_id}")
-
-        # Check if this handshake is for us
-        if packet.recipient_id_str and packet.recipient_id_str != self.my_peer_id:
-            debug_println(f"[NOISE] Handshake not for us, ignoring")
-            return
-
-        # Check payload size 
-        payload_size = len(packet.payload)
-        debug_println(f"[NOISE] Handshake payload size: {payload_size} bytes")
-        debug_println(f"[NOISE] Handshake payload hex: {packet.payload.hex()[:64]}...")
-
-        try:
-            # Convert bytearray to bytes for encryption service
-            payload_bytes = bytes(packet.payload) if isinstance(packet.payload, bytearray) else packet.payload
-            response = self.encryption_service.process_handshake_message(packet.sender_id_str, payload_bytes)
-            debug_println(f"[NOISE] process_handshake_message returned: {bool(response)}, response size: {len(response) if response else 0}")
-
-            if response:
-                # Send handshake response with proper recipient
-                response_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None
-                )
-                # Set TTL to 3 like iOS
-                response_data = bytearray(response_packet)
-                response_data[2] = 3
-                await self.send_packet(bytes(response_data))
-                debug_println(f"[NOISE] Sent handshake response to {packet.sender_id_str}, payload size: {len(response)}")
-
-            if self.encryption_service.is_session_established(packet.sender_id_str):
-                debug_println(f"[NOISE] Handshake completed with {packet.sender_id_str}")
-                # Clear handshake attempt time on success (matching Swift)
-                self.handshake_attempt_times.pop(packet.sender_id_str, None)
-                peer_nickname = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str
-                print(f"\r\033[K\033[92m✓ Secure session established with {peer_nickname}\033[0m")
-                print("> ", end='', flush=True)
-                # Add small delay before sending pending messages to avoid BLE congestion
-                await asyncio.sleep(0.1)
-                # Send any pending private messages
-                await self.send_pending_private_messages(packet.sender_id_str)
-
-        except Exception as e:
-            debug_println(f"[NOISE] Handshake init failed with {packet.sender_id_str}: {e}")
-            import traceback
-            debug_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
-            # Clear any partial handshake state
-            self.encryption_service.clear_handshake_state(packet.sender_id_str)
-
-    async def handle_noise_handshake_resp(self, packet: BitchatPacket):
-        """Handle Noise handshake response"""
-        debug_println(f"[NOISE] Received handshake response from {packet.sender_id_str}")
-        debug_println(f"[NOISE] Recipient ID: {packet.recipient_id_str}, My ID: {self.my_peer_id}")
-
-        # Check if this handshake response is for us
-        if packet.recipient_id_str and packet.recipient_id_str != self.my_peer_id:
-            debug_println(f"[NOISE] Handshake response not for us, ignoring")
-            return
-
-        payload_size = len(packet.payload)
-        debug_println(f"[NOISE] Handshake response payload size: {payload_size} bytes")
-        debug_println(f"[NOISE] Handshake response payload hex: {packet.payload.hex()[:64]}...")
-
-        try:
-            # Convert bytearray to bytes for encryption service
-            payload_bytes = bytes(packet.payload) if isinstance(packet.payload, bytearray) else packet.payload
-            response = self.encryption_service.process_handshake_message(packet.sender_id_str, payload_bytes)
-            debug_println(f"[NOISE] process_handshake_message returned: {bool(response)}, response size: {len(response) if response else 0}")
-
-            if response:
-                # Send final handshake message
-                final_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None  # Continue with same type
-                )
-                # Set TTL to 3 like iOS
-                final_data = bytearray(final_packet)
-                final_data[2] = 3
-                await self.send_packet(bytes(final_data))
-                debug_println(f"[NOISE] Sent final handshake message to {packet.sender_id_str}, payload size: {len(response)}")
-
-            if self.encryption_service.is_session_established(packet.sender_id_str):
-                debug_println(f"[NOISE] Handshake completed with {packet.sender_id_str}")
-                # Clear handshake attempt time on success (matching Swift)
-                self.handshake_attempt_times.pop(packet.sender_id_str, None)
-                peer_nickname = self.peers.get(packet.sender_id_str, Peer()).nickname or packet.sender_id_str
-                print(f"\r\033[K\033[92m✓ Secure session established with {peer_nickname}\033[0m")
-                print("> ", end='', flush=True)
-                # Add small delay before sending pending messages to avoid BLE congestion
-                await asyncio.sleep(0.1)
-                # Send any pending private messages
-                await self.send_pending_private_messages(packet.sender_id_str)
-
-        except Exception as e:
-            debug_println(f"[NOISE] Handshake response failed with {packet.sender_id_str}: {e}")
-            import traceback
-            debug_println(f"[NOISE] Handshake error details: {traceback.format_exc()}")
             # Clear any partial handshake state
             self.encryption_service.clear_handshake_state(packet.sender_id_str)
 
@@ -3007,11 +2888,11 @@ class BitchatClient:
         # Run input loop
         try:
             if (self.fromLoRa == None) and (self.toLoRa == None):
-                print("🚀 Running in normal mode, messages are not sent over LoRa. Client will work normally.")
+                print("\033[90m🚀 Running in normal mode, messages are not sent over LoRa. Client will work normally.\033[0m")
                 await self.input_loop()
             else:
-                print("🚀 Running in LoRa mode, bridging messages between BLE and LoRa queues...")
-                print("Any commands typed here will be ignored, as LoRa mode, presume no 'normal' client activity. To use normal client features, run without LoRa queues connected.")
+                print("\033[90m🚀 Running in LoRa mode, bridging messages between BLE and LoRa queues...\033[0m")
+                print("\033[90mAny commands typed here will be ignored, as LoRa mode, presume no 'normal' client activity. To use normal client features, run without LoRa queues connected.\033[0m")
                 await self.fromLoraLoop()
         except KeyboardInterrupt:
             pass

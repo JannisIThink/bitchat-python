@@ -13,11 +13,9 @@ Packet structure (Variable length):
 """
 
 import struct
-import time
-import os
 import zlib
 from enum import IntEnum
-from typing import Optional, List, Tuple
+from typing import Optional, List
 from dataclasses import dataclass
 
 # Protocol constants
@@ -78,16 +76,15 @@ class BitchatPacket:
     route: Optional[List[bytes]] = None
     signature: Optional[bytes] = None
     original_size: Optional[int] = None
-    
+
     @property
     def sender_id_str(self) -> str:
         """Return sender_id as hex string"""
         return self.sender_id.hex()
-    
+
     @property
     def recipient_id_str(self) -> Optional[str]:
         """Return recipient_id as hex string"""
-        return self.recipient_id.hex() if self.recipient_id else None
         return self.recipient_id.hex() if self.recipient_id else None
 
 
@@ -314,14 +311,14 @@ class BinaryProtocol:
             remaining_payload_length = payload_length - original_size_field_len
         else:
             remaining_payload_length = payload_length
-        
+
         if remaining_payload_length < 0:
             return None
-        
+
         payload_end = offset + remaining_payload_length
         if payload_end > len(data):
             return None
-        
+
         payload = data[offset:payload_end]
         offset = payload_end
 
