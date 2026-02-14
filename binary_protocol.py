@@ -96,8 +96,8 @@ class BinaryProtocol:
         """Encode packet to binary format"""
         data = bytearray()
 
-        # Determine version based on features
-        version = PROTOCOL_VERSION
+        # Respect packet.version for signature-compatible re-encoding (Android sends v1 by default)
+        version = packet.version if packet.version in (1, 2) else PROTOCOL_VERSION
         has_route = packet.route is not None and len(packet.route) > 0
 
         # Determine header size
@@ -325,6 +325,10 @@ class BinaryProtocol:
         # Decompress if IS_COMPRESSED flag is set (matching Android CompressionUtil.decompress)
         # Android uses raw deflate (no zlib/gzip headers)
         if flags & FLAG_IS_COMPRESSED and original_size is not None:
+            # Decompression bomb protection: reject extreme ratios (max 50:1)
+            MAX_DECOMPRESSION_RATIO = 50
+            if original_size > len(payload) * MAX_DECOMPRESSION_RATIO:
+                return None  # Suspicious compression ratio
             try:
                 # Try raw deflate first (Android default: Inflater(true))
                 payload = zlib.decompress(bytes(payload), -zlib.MAX_WBITS)
@@ -334,6 +338,9 @@ class BinaryProtocol:
                     payload = zlib.decompress(bytes(payload))
                 except zlib.error:
                     return None  # Decompression failed
+            # Verify decompressed size matches declared original_size
+            if len(payload) != original_size:
+                return None  # Size mismatch — possible tampering
 
         # Signature (if HAS_SIGNATURE flag)
         signature = None

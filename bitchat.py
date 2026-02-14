@@ -217,7 +217,7 @@ class BitchatClient:
         self.channel_key_commitments: Dict[str, str] = {}
         self.discovered_channels: Set[str] = set()
         # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
-        
+
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
         self.encryption_service = EncryptionService(identity_path=_identity_path)
         # Derive peer ID from Noise public key fingerprint (matching Android: first 8 bytes of SHA256)
@@ -1844,42 +1844,57 @@ class BitchatClient:
         return bytes(data)
 
     async def send_delivery_ack(self, message_id: str, sender_id: str, is_private: bool):
-        """Send delivery acknowledgment matching Android/iOS NoisePayload format"""
+        """Send delivery acknowledgment matching Android MessageHandler.sendDeliveryAck() exactly.
+
+        Android flow:
+        1. Only sends for PRIVATE_MESSAGE and FILE_TRANSFER (never public/channel)
+        2. Creates NoisePayload: [0x03 DELIVERED][messageID as UTF-8]
+        3. Encrypts via Noise session
+        4. Wraps in BitchatPacket(version=1, type=NOISE_ENCRYPTED, ttl=MESSAGE_TTL_HOPS)
+        """
+        if not is_private:
+            return  # Android never sends DELIVERED for public/channel messages
+
+        if not self.encryption_service.is_session_established(sender_id):
+            debug_println(f"[ACK] Skipping delivery ACK for {message_id} — no Noise session with {sender_id}")
+            return
+
         ack_id = f"{message_id}-{self.my_peer_id}"
         if not self.delivery_tracker.should_send_ack(ack_id):
             return
 
         debug_println(f"[ACK] Sending delivery ACK for message {message_id}")
 
-        if is_private and self.encryption_service.is_session_established(sender_id):
-            # Send as NoisePayload via NOISE_ENCRYPTED packet (matching Android/iOS)
-            # Format: [0x03 DELIVERED][messageID as UTF-8]
-            message_id_bytes = message_id.encode('utf-8')
-            noise_payload = bytearray()
-            noise_payload.append(NoisePayloadType.DELIVERED)  # 0x03
-            noise_payload.extend(message_id_bytes)
+        # Build NoisePayload: [0x03 DELIVERED][messageID as UTF-8]
+        message_id_bytes = message_id.encode('utf-8')
+        noise_payload = bytearray()
+        noise_payload.append(NoisePayloadType.DELIVERED)  # 0x03
+        noise_payload.extend(message_id_bytes)
 
-            try:
-                encrypted = self.encryption_service.encrypt_for_peer(sender_id, bytes(noise_payload))
+        try:
+            encrypted = self.encryption_service.encrypt_for_peer(sender_id, bytes(noise_payload))
 
-                ack_packet = create_bitchat_packet_with_recipient(
-                    self.my_peer_id,
-                    sender_id,
-                    MessageType.NOISE_ENCRYPTED,
-                    encrypted,
-                    None
-                )
+            # Convert sender/recipient IDs to 8-byte form
+            sender_bytes = bytes.fromhex(self.my_peer_id)[:8].ljust(8, b'\x00')
+            recipient_bytes = bytes.fromhex(sender_id)[:8].ljust(8, b'\x00')
 
-                # Set TTL to 7
-                ack_packet_data = bytearray(ack_packet)
-                ack_packet_data[2] = 7
-                await self.send_packet(bytes(ack_packet_data))
-            except Exception as e:
-                debug_println(f"[ACK] Failed to encrypt delivery ACK: {e}")
-        else:
-            # No Noise session available — cannot send unencrypted ACK
-            # (Android only supports ACKs as NoisePayloadType.DELIVERED inside NOISE_ENCRYPTED)
-            debug_println(f"[ACK] Skipping delivery ACK for {message_id} — no Noise session with {sender_id}")
+            # Create packet with version=1 matching Android (version=1u)
+            ack_packet = BitchatPacket(
+                version=1,  # Android uses version=1u for DELIVERED
+                msg_type=MessageType.NOISE_ENCRYPTED,
+                ttl=7,  # AppConstants.MESSAGE_TTL_HOPS
+                timestamp=int(time.time() * 1000),
+                sender_id=sender_bytes,
+                payload=encrypted,
+                recipient_id=recipient_bytes,
+                signature=None
+            )
+
+            encoded = BinaryProtocol.encode(ack_packet)
+            padded = pad_to_optimal_block_size(encoded)
+            await self.send_packet(padded)
+        except Exception as e:
+            debug_println(f"[ACK] Failed to encrypt delivery ACK: {e}")
 
     async def send_channel_announce(self, channel: str, is_protected: bool, key_commitment: Optional[str]):
         """Send channel announcement (matching Android: uses MESSAGE type with channel info)"""
