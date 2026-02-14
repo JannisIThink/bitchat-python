@@ -867,9 +867,9 @@ class BitchatClient:
                     handshake_packet = create_bitchat_packet_with_recipient(
                         self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
                     )
-                    # Set TTL to 3 like iOS
+                    # Set TTL to 7 like Android
                     handshake_data = bytearray(handshake_packet)
-                    handshake_data[2] = 3
+                    handshake_data[2] = 7
                     handshake_packet = bytes(handshake_data)
                     await self.send_packet(handshake_packet)
                     debug_println(f"[NOISE] Sent handshake init to {packet.sender_id_str}, payload size: {len(handshake_message)}")
@@ -1105,9 +1105,9 @@ class BitchatClient:
                 response_packet = create_bitchat_packet_with_recipient(
                     self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, response, None
                 )
-                # Set TTL to 3 like iOS
+                # Set TTL to 7 like Android
                 response_data = bytearray(response_packet)
-                response_data[2] = 3
+                response_data[2] = 7
                 await self.send_packet(bytes(response_data))
                 debug_println(f"[NOISE] Sent handshake response to {packet.sender_id_str}, payload size: {len(response)}")
 
@@ -1436,9 +1436,9 @@ class BitchatClient:
                         handshake_packet = create_bitchat_packet_with_recipient(
                             self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
                         )
-                        # Set TTL to 3 like iOS
+                        # Set TTL to 7 like Android
                         handshake_data = bytearray(handshake_packet)
-                        handshake_data[2] = 3
+                        handshake_data[2] = 7
                         handshake_packet = bytes(handshake_data)
                         await self.send_packet(handshake_packet)
                         debug_println(f"[NOISE] Initiated handshake with {peer_id}")
@@ -1838,9 +1838,9 @@ class BitchatClient:
                     None
                 )
 
-                # Set TTL to 3
+                # Set TTL to 7
                 ack_packet_data = bytearray(ack_packet)
-                ack_packet_data[2] = 3
+                ack_packet_data[2] = 7
                 await self.send_packet(bytes(ack_packet_data))
             except Exception as e:
                 debug_println(f"[ACK] Failed to encrypt delivery ACK: {e}")
@@ -2377,9 +2377,9 @@ class BitchatClient:
                 self.my_peer_id, MessageType.LEAVE, leave_payload
             )
 
-            # Set TTL to 3
+            # Set TTL to 7
             leave_packet_data = bytearray(leave_packet)
-            leave_packet_data[2] = 3
+            leave_packet_data[2] = 7
 
             await self.send_packet(bytes(leave_packet_data))
 
@@ -2620,9 +2620,9 @@ class BitchatClient:
                 handshake_packet = create_bitchat_packet_with_recipient(
                     self.my_peer_id, target_peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
                 )
-                # Set TTL to 3 like iOS
+                # Set TTL to 7 like Android
                 handshake_data = bytearray(handshake_packet)
-                handshake_data[2] = 3
+                handshake_data[2] = 7
                 handshake_packet = bytes(handshake_data)
                 await self.send_packet(handshake_packet)
                 debug_println(f"[NOISE] Sent handshake init to {target_peer_id}, payload size: {len(handshake_message)}")
@@ -2852,7 +2852,7 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     package = self.fromLoRa.get()
                     print("Got:",parse_bitchat_packet(package))
-                    self.notification_handler(None,package,True)
+                    await self.notification_handler(None,package,True)
                 else:
                     time.sleep(600)
             except KeyboardInterrupt:
@@ -3236,10 +3236,6 @@ def create_bitchat_message_payload_full(sender: str, content: str, channel: Opti
         channel_bytes = channel.encode('utf-8')
         data.append(len(channel_bytes))
         data.extend(channel_bytes)
-
-    return (bytes(data), message_id)
-
-
 
     return (bytes(data), message_id)
 
