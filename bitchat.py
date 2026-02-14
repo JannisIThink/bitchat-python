@@ -107,6 +107,7 @@ class Peer:
     nickname: Optional[str] = None
     public_key: Optional[bytes] = None
     fingerprint: Optional[str] = None
+    signing_public_key: Optional[bytes] = None  # Ed25519 signing key (32 bytes)
 
 @dataclass
 class BitchatMessage:
@@ -813,6 +814,7 @@ class BitchatClient:
     async def handle_announce(self, packet: BitchatPacket, raw_data: bytes = b'', noRelay: bool = False):
         """Handle peer announcement"""
         peer_nickname = None
+        announce_signing_key = None
 
         # Check if this is a Noise Identity Announcement (has signature) or simple text announce
         if packet.signature:
@@ -821,9 +823,23 @@ class BitchatClient:
                 result = self.parse_noise_identity_announcement_binary(packet.payload)
                 if result and isinstance(result, dict):
                     peer_nickname = result.get('nickname', None)
+                    # Extract signing key for storage
+                    spk_hex = result.get('signingPublicKey', '')
+                    if spk_hex and len(spk_hex) == 64:
+                        announce_signing_key = bytes.fromhex(spk_hex)
             except Exception as e:
                 debug_println(f"[ANNOUNCE] Failed to parse Noise Identity Announcement: {e}")
                 peer_nickname = None
+
+            # Verify signature on ANNOUNCE — extract signing key from payload (like Android)
+            if packet.signature and len(packet.signature) == 64:
+                signing_key = announce_signing_key or extract_signing_key_from_announce_payload(packet.payload)
+                if signing_key:
+                    if not verify_incoming_packet_signature(packet, signing_key, self.encryption_service):
+                        debug_println(f"[VERIFY] ✗ Invalid signature on ANNOUNCE from {packet.sender_id_str} — dropping")
+                        return
+                    else:
+                        debug_println(f"[VERIFY] ✓ Valid signature on ANNOUNCE from {packet.sender_id_str}")
 
         # Fallback to text decoding if we don't have a nickname yet
         if not peer_nickname:
@@ -853,6 +869,8 @@ class BitchatClient:
             self.peers[packet.sender_id_str] = Peer()
 
         self.peers[packet.sender_id_str].nickname = peer_nickname
+        if announce_signing_key:
+            self.peers[packet.sender_id_str].signing_public_key = announce_signing_key
 
         if is_new_peer:
             print(f"\r\033[K\033[33m{peer_nickname} connected\033[0m\n> ", end='', flush=True)
@@ -914,6 +932,16 @@ class BitchatClient:
 
     async def handle_message(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle chat message"""
+        # Verify signature if present (matching Android SecurityManager)
+        if packet.signature and len(packet.signature) == 64:
+            peer = self.peers.get(packet.sender_id_str)
+            if peer and peer.signing_public_key:
+                if not verify_incoming_packet_signature(packet, peer.signing_public_key, self.encryption_service):
+                    debug_println(f"[VERIFY] ✗ Invalid signature on MESSAGE from {packet.sender_id_str} — dropping")
+                    return
+                else:
+                    debug_println(f"[VERIFY] ✓ Valid signature on MESSAGE from {packet.sender_id_str}")
+
         # Check if sender is blocked
         fingerprint = self.encryption_service.get_peer_fingerprint(packet.sender_id_str)
         if fingerprint and fingerprint in self.blocked_peers:
@@ -1336,41 +1364,6 @@ class BitchatClient:
             self.chat_context.add_channel(channel)
             await self.save_app_state()
 
-    async def handle_delivery_ack(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
-        """Handle delivery acknowledgment"""
-        is_for_us = packet.recipient_id_str == self.my_peer_id if packet.recipient_id_str else False
-
-        if is_for_us:
-            # Decrypt if needed
-            ack_payload = packet.payload
-            if packet.ttl == 3 and self.encryption_service.is_session_established(packet.sender_id_str):
-                try:
-                    ack_payload = self.encryption_service.decrypt_from_peer(packet.sender_id_str, packet.payload)
-                except:
-                    pass
-
-            # Parse ACK
-            try:
-                ack_data = json.loads(ack_payload)
-                ack = DeliveryAck(
-                    ack_data['originalMessageID'],
-                    ack_data['ackID'],
-                    ack_data['recipientID'],
-                    ack_data['recipientNickname'],
-                    ack_data['timestamp'],
-                    ack_data['hopCount']
-                )
-
-                if self.delivery_tracker.mark_delivered(ack.original_message_id):
-                    print(f"\r\u001b[K\u001b[90m✓ Delivered to {ack.recipient_nickname}\u001b[0m\n> ", end='', flush=True)
-
-            except Exception as e:
-                debug_println(f"[ACK] Failed to parse delivery ACK: {e}")
-
-        elif packet.ttl > 1:
-            # Relay ACK
-            await self._relay_packet(packet, raw_data, noRelay)
-
     async def handle_noise_identity_announce(self, packet: BitchatPacket):
         """Handle Noise identity announcement"""
         try:
@@ -1421,6 +1414,11 @@ class BitchatClient:
             if peer_id not in self.peers:
                 self.peers[peer_id] = Peer()
             self.peers[peer_id].nickname = nickname
+
+            # Store signing public key if available
+            signing_key_hex = announcement.get('signingPublicKey', '')
+            if signing_key_hex and len(signing_key_hex) == 64:  # 32 bytes = 64 hex chars
+                self.peers[peer_id].signing_public_key = bytes.fromhex(signing_key_hex)
 
             if is_new_peer:
                 print(f"\r\033[K\033[33m{nickname} connected\033[0m\n> ", end='', flush=True)
@@ -2647,6 +2645,11 @@ class BitchatClient:
 
         # Build TLV payload (PrivateMessagePacket) matching Android/iOS:
         # [type=0x00][length][messageID] [type=0x01][length][content]
+        # Android PrivateMessagePacket.encode() returns null if length > 255
+        if len(message_id_bytes) > 255 or len(content_bytes) > 255:
+            print(f"\r\033[K\033[91m✗ Message too long ({len(content_bytes)} bytes). Maximum is 255 bytes per TLV field.\033[0m")
+            print("> ", end='', flush=True)
+            return
         tlv_data = bytearray()
         tlv_data.append(0x00)  # TLV type: MESSAGE_ID
         tlv_data.append(len(message_id_bytes))
@@ -2745,6 +2748,47 @@ class BitchatClient:
             debug_println(f"[PRIVATE] Failed to encrypt private message: {e}")
             print(f"\033[91m✗ Failed to send encrypted message to {target_nickname}\033[0m")
             print(f"\033[90m» Error: {e}\033[0m")
+
+    async def periodic_announcer(self):
+        """Periodically re-broadcast identity + text ANNOUNCE (every 30s, matching Android)"""
+        while self.running:
+            await asyncio.sleep(30)
+            if not self.running:
+                break
+            if not self.client or not self.client.is_connected:
+                continue
+            try:
+                # 1. Noise identity announcement (binary TLV with signature)
+                timestamp_ms = int(time.time() * 1000)
+                public_key_bytes = self.encryption_service.get_public_key()
+                signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
+
+                timestamp_data = str(timestamp_ms).encode('utf-8')
+                binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
+                signature = self.encryption_service.sign_data(binding_data)
+
+                identity_payload = self.encode_noise_identity_announcement_binary(
+                    self.my_peer_id, public_key_bytes, signing_public_key_bytes,
+                    self.nickname, timestamp_ms, signature
+                )
+                identity_packet = create_bitchat_packet(
+                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload
+                )
+                identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
+                await self.send_packet(identity_packet)
+
+                await asyncio.sleep(0.5)
+
+                # 2. Simple text announce (nickname only)
+                announce_packet = create_bitchat_packet(
+                    self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
+                )
+                announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
+                await self.send_packet(announce_packet)
+
+                debug_println(f"[ANNOUNCE] Periodic re-announce sent")
+            except Exception as e:
+                debug_println(f"[ANNOUNCE] Periodic announce failed: {e}")
 
     async def background_scanner(self):
         """Background task to scan for peers when not connected"""
@@ -2885,6 +2929,9 @@ class BitchatClient:
         if not connected or not self.client:
             scanner_task = asyncio.create_task(self.background_scanner())
 
+        # Start periodic announcer (re-broadcasts identity every 30s like Android)
+        announcer_task = asyncio.create_task(self.periodic_announcer())
+
         # Run input loop
         try:
             if (self.fromLoRa == None) and (self.toLoRa == None):
@@ -2910,6 +2957,13 @@ class BitchatClient:
                     await asyncio.sleep(0.1)  # Give time for the packet to send
                 except:
                     pass  # Ignore errors during shutdown
+
+            # Cancel periodic announcer
+            announcer_task.cancel()
+            try:
+                await announcer_task
+            except asyncio.CancelledError:
+                pass
 
             # Cancel background scanner
             if scanner_task:
@@ -3033,6 +3087,56 @@ def sign_outgoing_packet(packet_bytes: bytes, encryption_service) -> bytes:
     debug_full_println(f"[SIGN] Signed packet type={packet.msg_type.name}, sig={ed25519_signature[:8].hex()}...")
     return final_padded
 
+def verify_incoming_packet_signature(packet: BitchatPacket, signing_public_key: bytes, encryption_service) -> bool:
+    """Verify Ed25519 signature on an incoming packet.
+    Matches Android SecurityManager.verifyPacketSignature():
+    1. Create signing version with TTL=0, no signature
+    2. Encode + pad
+    3. Verify signature against that data
+    """
+    if not packet.signature or len(packet.signature) != 64:
+        return False  # No signature to verify
+
+    if not signing_public_key or len(signing_public_key) != 32:
+        return False  # No valid key
+
+    # Create signing data (TTL=0, no signature) — same as toBinaryDataForSigning()
+    signing_packet = BitchatPacket(
+        version=packet.version,
+        msg_type=packet.msg_type,
+        ttl=0,  # Fixed TTL=0 for signing
+        timestamp=packet.timestamp,
+        sender_id=packet.sender_id,
+        payload=packet.payload,
+        recipient_id=packet.recipient_id,
+        signature=None,
+        route=packet.route
+    )
+    signing_encoded = BinaryProtocol.encode(signing_packet)
+    signing_padded = pad_to_optimal_block_size(signing_encoded)
+
+    return encryption_service.verify_ed25519_signature(packet.signature, signing_padded, signing_public_key)
+
+def extract_signing_key_from_announce_payload(payload: bytes) -> Optional[bytes]:
+    """Extract Ed25519 signing public key (TLV type 0x03) from ANNOUNCE payload.
+    Used for signature verification of ANNOUNCE packets where we don't yet have the
+    peer's signing key stored. Matches Android SecurityManager.verifyPacketSignature()
+    which extracts the key from IdentityAnnouncement.decode(payload)."""
+    try:
+        offset = 0
+        # Try TLV parsing: [type][length][value]...
+        while offset + 2 <= len(payload):
+            tlv_type = payload[offset]; offset += 1
+            tlv_len = payload[offset]; offset += 1
+            if offset + tlv_len > len(payload):
+                break
+            if tlv_type == 0x03 and tlv_len == 32:  # SIGNING_PUBLIC_KEY
+                return payload[offset:offset+tlv_len]
+            offset += tlv_len
+    except Exception:
+        pass
+    return None
+
 def parse_bitchat_packet(data: bytes) -> Optional[BitchatPacket]:
     """Parse a BitChat packet from raw bytes (two-pass decode matching Android)"""
     # First try: decode as-is (works even with padding because decoder reads by field position)
@@ -3117,7 +3221,14 @@ def parse_bitchat_message_payload(data: bytes) -> BitchatMessage:
         channel_len = data[offset]; offset += 1
         channel = data[offset:offset+channel_len].decode('utf-8')
 
-    return BitchatMessage(id_str, content, channel, is_encrypted, encrypted_content)
+    return BitchatMessage(
+        id=id_str,
+        content=content,
+        sender=sender,
+        channel=channel,
+        is_encrypted=is_encrypted,
+        encrypted_content=encrypted_content
+    )
 
 def create_bitchat_packet(sender_id: str, msg_type: MessageType, payload: bytes) -> bytes:
     """Create a BitChat packet"""
@@ -3240,7 +3351,7 @@ def create_bitchat_message_payload_full(sender: str, content: str, channel: Opti
     return (bytes(data), message_id)
 
 def unpad_message(data: bytes) -> bytes:
-    """Remove PKCS#7 padding"""
+    """Remove PKCS#7 padding with strict validation (all padding bytes must match)"""
     if not data:
         return data
 
@@ -3249,7 +3360,11 @@ def unpad_message(data: bytes) -> bytes:
     if padding_length == 0 or padding_length > len(data) or padding_length > 255:
         return data
 
-    return data[:-padding_length]
+    # Strict PKCS#7: every padding byte must equal padding_length
+    if all(b == padding_length for b in data[-padding_length:]):
+        return data[:-padding_length]
+
+    return data  # Invalid padding — return unchanged
 
 def create_encrypted_channel_message_payload(sender: str, content: str, channel: str, key: bytes, encryption_service, sender_peer_id: str) -> Tuple[bytes, str]:
     """Create encrypted channel message payload"""

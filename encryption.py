@@ -853,6 +853,18 @@ class EncryptionService:
         """Sign data with our Ed25519 signing key (64-byte signature)"""
         return self.signing_private_key.sign(data)
 
+    @staticmethod
+    def verify_ed25519_signature(signature: bytes, data: bytes, public_key_bytes: bytes) -> bool:
+        """Verify an Ed25519 signature using a raw 32-byte public key.
+        Returns True if valid, False otherwise.
+        Matches Android's NoiseEncryptionService.verifyWithEd25519()."""
+        try:
+            public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+            public_key.verify(signature, data)
+            return True
+        except Exception:
+            return False
+
     def remove_session(self, peer_id: str):
         """Remove session with a peer"""
         if peer_id in self.sessions:
