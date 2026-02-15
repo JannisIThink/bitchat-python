@@ -403,6 +403,10 @@ class BitchatClient:
 
     async def connect(self):
         """Connect to BitChat service"""
+        if self.disable_bluetooth_transmission:
+            debug_println("[BT DISABLED] Skipping Bluetooth scanning and connection")
+            return True
+
         print("\033[90m» Scanning for bitchat service...\033[0m")
 
         scan_attempts = 0
@@ -2831,6 +2835,8 @@ class BitchatClient:
             await asyncio.sleep(30)
             if not self.running:
                 break
+            if self.disable_bluetooth_transmission:
+                continue
             if not self.client or not self.client.is_connected:
                 continue
             try:
@@ -2871,6 +2877,16 @@ class BitchatClient:
         last_cleanup = time.time()
 
         while self.running:
+            # If Bluetooth is disabled, only do session cleanup, skip scanning
+            if self.disable_bluetooth_transmission:
+                current_time = time.time()
+                if current_time - last_cleanup > 300:
+                    self.encryption_service.cleanup_old_sessions()
+                    last_cleanup = current_time
+                    debug_println(f"[CLEANUP] Cleaned up old encryption sessions")
+                await asyncio.sleep(5)
+                continue
+
             # Clean up old sessions periodically (every 5 minutes)
             current_time = time.time()
             if current_time - last_cleanup > 300:  # 5 minutes
