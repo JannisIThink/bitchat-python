@@ -216,6 +216,8 @@ class BitchatClient:
         self.password_protected_channels: Set[str] = set()
         self.channel_key_commitments: Dict[str, str] = {}
         self.discovered_channels: Set[str] = set()
+        # When True, all processing happens normally but actual BT send/receive is skipped
+        self.disable_bluetooth_transmission: bool = False
         # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
 
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
@@ -555,6 +557,15 @@ class BitchatClient:
     async def send_packet(self, packet: bytes, via_lora: bool = True):
         """Send packet via BLE (with fragmentation if needed), and optionally also via LoRa."""
         debug_full_println(f"[RAW SEND] {packet.hex()}")
+
+        # If Bluetooth transmission is disabled, skip everything except LoRa
+        if self.disable_bluetooth_transmission:
+            debug_println("[BT DISABLED] Skipping Bluetooth transmission (processing complete, BT send disabled)")
+            # Still send via LoRa if requested
+            if via_lora and self.toLoRa is not None:
+                self.toLoRa.put(packet)
+            return
+
         if not self.client or not self.characteristic:
             debug_println("[!] No connection available. Message queued.")
             # In a real implementation, we might queue messages here
@@ -618,6 +629,11 @@ class BitchatClient:
 
     async def send_packet_with_fragmentation(self, packet: bytes):
         """Fragment and send large packets (matching Android FragmentManager.createFragments)"""
+        # If Bluetooth transmission is disabled, skip the actual sending
+        if self.disable_bluetooth_transmission:
+            debug_println("[BT DISABLED] Skipping Bluetooth transmission of fragmented packet")
+            return
+
         if not self.client or not self.characteristic:
             debug_println("[!] No connection available. Cannot send fragmented message.")
             return
@@ -723,6 +739,11 @@ class BitchatClient:
 
     async def notification_handler(self, sender: BleakGATTCharacteristic, data: bytes, noRelay: bool = False):
         """Handle incoming BLE notifications"""
+        # If Bluetooth transmission is disabled, skip receiving/processing
+        if self.disable_bluetooth_transmission:
+            debug_println("[BT DISABLED] Skipping Bluetooth receive (BT receive disabled)")
+            return
+
         try:
             # Enhanced hex logging to match iOS format
             hex_string = ' '.join(f'{b:02X}' for b in data)
