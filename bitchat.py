@@ -229,6 +229,8 @@ class BitchatClient:
         self.running = True
         self.background_scanner_task = None  # Track background scanner task
         self.disconnection_callback_registered = False
+        self._last_disconnect_time: float = 0  # Track last disconnect for backoff
+        self._consecutive_failures: int = 0  # Track consecutive connection failures for exponential backoff
 
         # Handshake timing tracking (like Swift implementation)
         self.handshake_attempt_times: Dict[str, float] = {}
@@ -379,6 +381,8 @@ class BitchatClient:
         print(f"\r\033[K\033[91m✗ Disconnected from BitChat network\033[0m")
         print("\033[90m» Scanning for other devices...\033[0m")
         print("> ", end='', flush=True)
+        self._last_disconnect_time = time.time()
+        self._consecutive_failures += 1
 
         # Clear connection state
         self.client = None
@@ -2899,6 +2903,13 @@ class BitchatClient:
                 debug_println(f"[CLEANUP] Cleaned up old encryption sessions")
 
             if not self.client or not self.client.is_connected:
+                # Exponential backoff: wait longer after consecutive failures
+                # to avoid spamming connect attempts on flaky BLE links
+                if self._consecutive_failures > 0:
+                    backoff = min(2 ** self._consecutive_failures, 30)  # 2s, 4s, 8s, … max 30s
+                    debug_println(f"[SCANNER] Backoff {backoff}s after {self._consecutive_failures} consecutive failures")
+                    await asyncio.sleep(backoff)
+
                 # Try to find and connect to a peer
                 device = await self.find_device()
                 if device:
@@ -2965,10 +2976,13 @@ class BitchatClient:
                             await self.send_packet(announce_packet)
 
                             print("> ", end='', flush=True)
+                            # Reset failure counter on successful connection
+                            self._consecutive_failures = 0
                     except Exception as e:
                         debug_println(f"[SCANNER] Connection attempt failed: {e}")
                         self.client = None
                         self.characteristic = None
+                        self._consecutive_failures += 1
 
             # Wait before next scan
             await asyncio.sleep(5)  # Scan every 5 seconds when not connected
