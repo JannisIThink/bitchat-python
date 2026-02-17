@@ -2837,7 +2837,11 @@ class BitchatClient:
                 break
             if self.disable_bluetooth_transmission:
                 continue
-            if not self.client or not self.client.is_connected:
+            # Allow announcements even without BLE when LoRa is available,
+            # so that LoRa-only peers can discover this node.
+            has_ble = self.client and self.client.is_connected
+            has_lora = self.toLoRa is not None
+            if not has_ble and not has_lora:
                 continue
             try:
                 # 1. Noise identity announcement (binary TLV with signature)
@@ -2988,7 +2992,7 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     try:
                         package = self.fromLoRa.get_nowait()
-                        print("Got:",parse_bitchat_packet(package))
+                        #print("Got:",hash((package)))
                         await self.notification_handler(None,package,True)
                     except Exception:
                         # Queue empty — yield to event loop briefly
