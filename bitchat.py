@@ -409,8 +409,11 @@ class BitchatClient:
         if isinstance(self.chat_context.current_mode, PrivateDM):
             self.chat_context.switch_to_public()
 
-        # Restart background scanner if not already running
-        if not self.background_scanner_task or self.background_scanner_task.done():
+        # Restart background scanner if not already running.
+        # Cancel any lingering old task first to prevent duplicates.
+        if self.background_scanner_task and not self.background_scanner_task.done():
+            debug_println("[DISCONNECT] Scanner already running, not starting a new one")
+        else:
             self.background_scanner_task = asyncio.create_task(self.background_scanner())
 
     async def connect(self):
@@ -3007,7 +3010,8 @@ class BitchatClient:
                         self._consecutive_failures = 0
                     except Exception as e:
                         debug_println(f"[SCANNER] Connection attempt failed: {e}")
-                        # Clean up the failed client properly
+                        # Clean up the failed client properly WHILE still in _connecting state
+                        # so that the disconnected_callback is suppressed during cleanup.
                         try:
                             if self.client and self.client.is_connected:
                                 await self.client.disconnect()
@@ -3016,7 +3020,6 @@ class BitchatClient:
                         self.client = None
                         self.characteristic = None
                         self._consecutive_failures += 1
-                    finally:
                         self._connecting = False
 
             # Wait before next scan
@@ -3055,11 +3058,9 @@ class BitchatClient:
             except KeyboardInterrupt:
                 self.running = False
                 break
-            except queue.Empty:
-                await asyncio.sleep(0.05)
-                continue
             except Exception as e:
                 debug_println(f"[ERROR] Queue error: {e}")
+                await asyncio.sleep(0.05)
                 continue
 
     async def run(self):
