@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import queue
 import sys
 import os
 import time
@@ -231,6 +232,7 @@ class BitchatClient:
         self.disconnection_callback_registered = False
         self._last_disconnect_time: float = 0  # Track last disconnect for backoff
         self._consecutive_failures: int = 0  # Track consecutive connection failures for exponential backoff
+        self._connecting: bool = False  # Guard flag to prevent disconnect callback during connection setup
 
         # Handshake timing tracking (like Swift implementation)
         self.handshake_attempt_times: Dict[str, float] = {}
@@ -378,6 +380,12 @@ class BitchatClient:
 
     def handle_disconnect(self, client: BleakClient):
         """Handle disconnection from peer"""
+        # If we're in the middle of a connection attempt, don't interfere —
+        # the connecting code handles its own cleanup.
+        if self._connecting:
+            debug_println("[DISCONNECT] Disconnect during connection setup — ignored (setup handles cleanup)")
+            return
+
         print(f"\r\033[K\033[91m✗ Disconnected from BitChat network\033[0m")
         print("\033[90m» Scanning for other devices...\033[0m")
         print("> ", end='', flush=True)
@@ -440,9 +448,15 @@ class BitchatClient:
         print("\033[90m» Found bitchat service! Connecting...\033[0m")
         debug_println("[1] Match Found! Connecting...")
 
+        self._connecting = True
         try:
             self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
             await self.client.connect()
+
+            # Small stabilization delay — some BLE peripherals drop immediately
+            await asyncio.sleep(0.3)
+            if not self.client.is_connected:
+                raise Exception("Connection dropped during stabilization")
 
             # Find characteristic
             services = self.client.services
@@ -470,12 +484,17 @@ class BitchatClient:
         except Exception as e:
             print(f"\n\033[91m❌ Connection failed\033[0m")
             print(f"\033[90mReason: {e}\033[0m")
-            #print("\033[90mPlease check:\033[0m")
-            #print("\033[90m  • Bluetooth is enabled\033[0m")
-            #print("\033[90m  • The other device is running BitChat\033[0m")
-            #print("\033[90m  • You're within range\033[0m")
-            #print("\n\033[90mTry running the command again.\033[0m")
+            # Clean up the failed client so the disconnect callback doesn't fire later
+            try:
+                if self.client and self.client.is_connected:
+                    await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+            self.characteristic = None
             return False
+        finally:
+            self._connecting = False
 
     async def handshake(self):
         """Perform initial handshake"""
@@ -566,22 +585,23 @@ class BitchatClient:
         """Send packet via BLE (with fragmentation if needed), and optionally also via LoRa."""
         debug_full_println(f"[RAW SEND] {packet.hex()}")
 
-        # If Bluetooth transmission is disabled, skip everything except LoRa
+        # Always send via LoRa first, regardless of BLE state.
+        # LoRa transmission must not depend on whether BLE is connected.
+        if via_lora and self.toLoRa is not None:
+            self.toLoRa.put(packet)
+
+        # If Bluetooth transmission is disabled, skip BLE send
         if self.disable_bluetooth_transmission:
             debug_println("[BT DISABLED] Skipping Bluetooth transmission (processing complete, BT send disabled)")
-            # Still send via LoRa if requested
-            if via_lora and self.toLoRa is not None:
-                self.toLoRa.put(packet)
             return
 
         if not self.client or not self.characteristic:
-            debug_println("[!] No connection available. Message queued.")
-            # In a real implementation, we might queue messages here
+            debug_println("[!] No BLE connection available. Packet sent via LoRa only.")
             return
 
         # Check if still connected before sending
         if not self.client.is_connected:
-            debug_println("[!] Connection lost. Cannot send packet.")
+            debug_println("[!] Connection lost. Cannot send BLE packet.")
             # Trigger disconnection handling if not already done
             if self.client:
                 self.handle_disconnect(self.client)
@@ -630,10 +650,6 @@ class BitchatClient:
                             raise e2
                 else:
                     raise e
-
-        # Also send via LoRa (for originating packets; relays pass via_lora=False)
-        if via_lora and self.toLoRa is not None:
-            self.toLoRa.put(packet)
 
     async def send_packet_with_fragmentation(self, packet: bytes):
         """Fragment and send large packets (matching Android FragmentManager.createFragments)"""
@@ -2914,9 +2930,15 @@ class BitchatClient:
                 device = await self.find_device()
                 if device:
                     print(f"\r\033[K\033[92m» Found a BitChat device! Connecting...\033[0m")
+                    self._connecting = True
                     try:
                         self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
                         await self.client.connect()
+
+                        # Small stabilization delay — some BLE peripherals drop immediately
+                        await asyncio.sleep(0.3)
+                        if not self.client.is_connected:
+                            raise Exception("Connection dropped during stabilization")
 
                         # Find characteristic
                         services = self.client.services
@@ -2928,61 +2950,74 @@ class BitchatClient:
                             if self.characteristic:
                                 break
 
-                        if self.characteristic:
-                            # Subscribe to notifications
-                            await self.client.start_notify(self.characteristic, self.notification_handler)
-                            print(f"\r\033[K\033[92m✓ Connected to BitChat network!\033[0m")
+                        if not self.characteristic:
+                            raise Exception("Characteristic not found")
 
-                            # Clear any stale peers from previous connection
-                            self.peers.clear()
+                        # Subscribe to notifications
+                        await self.client.start_notify(self.characteristic, self.notification_handler)
+                        print(f"\r\033[K\033[92m✓ Connected to BitChat network!\033[0m")
 
-                            # Send Noise identity announcement
-                            try:
-                                timestamp_ms = int(time.time() * 1000)
-                                public_key_bytes = self.encryption_service.get_public_key()
-                                signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
+                        # Mark connection setup as done BEFORE sending announcements
+                        self._connecting = False
 
-                                # Create binding data for signature
-                                timestamp_data = str(timestamp_ms).encode('utf-8')
-                                binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
-                                signature = self.encryption_service.sign_data(binding_data)
+                        # Clear any stale peers from previous connection
+                        self.peers.clear()
 
-                                # Encode to binary format
-                                identity_payload = self.encode_noise_identity_announcement_binary(
-                                    self.my_peer_id, public_key_bytes, signing_public_key_bytes,
-                                    self.nickname, timestamp_ms, signature
-                                )
+                        # Send Noise identity announcement
+                        try:
+                            timestamp_ms = int(time.time() * 1000)
+                            public_key_bytes = self.encryption_service.get_public_key()
+                            signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
 
-                                identity_packet = create_bitchat_packet(
-                                    self.my_peer_id, MessageType.ANNOUNCE, identity_payload
-                                )
-                                identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
-                                await self.send_packet(identity_packet)
-                            except Exception as e:
-                                debug_println(f"[SCANNER] Failed to send identity: {e}")
-                                # Fallback
-                                key_exchange_payload = self.encryption_service.get_combined_public_key_data()
-                                key_exchange_packet = create_bitchat_packet(
-                                    self.my_peer_id, MessageType.NOISE_HANDSHAKE, key_exchange_payload
-                                )
-                                await self.send_packet(key_exchange_packet)
+                            # Create binding data for signature
+                            timestamp_data = str(timestamp_ms).encode('utf-8')
+                            binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
+                            signature = self.encryption_service.sign_data(binding_data)
 
-                            await asyncio.sleep(0.5)
-
-                            announce_packet = create_bitchat_packet(
-                                self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
+                            # Encode to binary format
+                            identity_payload = self.encode_noise_identity_announcement_binary(
+                                self.my_peer_id, public_key_bytes, signing_public_key_bytes,
+                                self.nickname, timestamp_ms, signature
                             )
-                            announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
-                            await self.send_packet(announce_packet)
 
-                            print("> ", end='', flush=True)
-                            # Reset failure counter on successful connection
-                            self._consecutive_failures = 0
+                            identity_packet = create_bitchat_packet(
+                                self.my_peer_id, MessageType.ANNOUNCE, identity_payload
+                            )
+                            identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
+                            await self.send_packet(identity_packet)
+                        except Exception as e:
+                            debug_println(f"[SCANNER] Failed to send identity: {e}")
+                            # Fallback
+                            key_exchange_payload = self.encryption_service.get_combined_public_key_data()
+                            key_exchange_packet = create_bitchat_packet(
+                                self.my_peer_id, MessageType.NOISE_HANDSHAKE, key_exchange_payload
+                            )
+                            await self.send_packet(key_exchange_packet)
+
+                        await asyncio.sleep(0.5)
+
+                        announce_packet = create_bitchat_packet(
+                            self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
+                        )
+                        announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
+                        await self.send_packet(announce_packet)
+
+                        print("> ", end='', flush=True)
+                        # Reset failure counter on successful connection
+                        self._consecutive_failures = 0
                     except Exception as e:
                         debug_println(f"[SCANNER] Connection attempt failed: {e}")
+                        # Clean up the failed client properly
+                        try:
+                            if self.client and self.client.is_connected:
+                                await self.client.disconnect()
+                        except Exception:
+                            pass
                         self.client = None
                         self.characteristic = None
                         self._consecutive_failures += 1
+                    finally:
+                        self._connecting = False
 
             # Wait before next scan
             await asyncio.sleep(5)  # Scan every 5 seconds when not connected
@@ -3004,20 +3039,28 @@ class BitchatClient:
             try:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
-                    try:
-                        package = self.fromLoRa.get_nowait()
-                        #print("Got:",hash((package)))
-                        await self.notification_handler(None,package,True)
-                    except Exception:
-                        # Queue empty — yield to event loop briefly
+                    if self.fromLoRa.empty():
                         await asyncio.sleep(0.05)
+                        continue
+                    else:
+                        package = self.fromLoRa.get_nowait()
+                        try:
+                            #print("Got:",hash((package)))
+                            await self.notification_handler(None,package,True)
+                        except Exception as e:
+                            debug_println(f"[LORA] Error processing LoRa packet: {e}")
+                            debug_println(f"[LORA] Traceback: {traceback.format_exc()}")
                 else:
                     await asyncio.sleep(600) # Sleep to avoid busy loop if fromLoRa is not set
             except KeyboardInterrupt:
                 self.running = False
                 break
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
             except Exception as e:
                 debug_println(f"[ERROR] Queue error: {e}")
+                continue
 
     async def run(self):
         """Main run loop"""
