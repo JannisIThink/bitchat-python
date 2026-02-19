@@ -3042,18 +3042,18 @@ class BitchatClient:
             try:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
-                    if self.fromLoRa.empty():
+                    try:
+                        package = self.fromLoRa.get_nowait()
+                    except queue.Empty:
                         await asyncio.sleep(0.05)
                         continue
-                    else:
-                        package = self.fromLoRa.get_nowait()
-                        print(f"[LORA] Received package from queue: {len(package)} bytes, first bytes: {package[:20].hex() if len(package) >= 20 else package.hex()}")
-                        try:
-                            await self.notification_handler(None,package,True)
-                            print(f"[LORA] Package processed successfully")
-                        except Exception as e:
-                            print(f"[LORA] Error processing LoRa packet: {e}")
-                            print(f"[LORA] Traceback: {traceback.format_exc()}")
+                    print(f"[LORA] Received package from queue: {len(package)} bytes, first bytes: {package[:20].hex() if len(package) >= 20 else package.hex()}")
+                    try:
+                        await self.notification_handler(None,package,True)
+                        print(f"[LORA] Package processed successfully")
+                    except Exception as e:
+                        print(f"[LORA] Error processing LoRa packet: {e}")
+                        print(f"[LORA] Traceback: {traceback.format_exc()}")
                 else:
                     await asyncio.sleep(600) # Sleep to avoid busy loop if fromLoRa is not set
             except KeyboardInterrupt:
