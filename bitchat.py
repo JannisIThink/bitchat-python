@@ -767,7 +767,7 @@ class BitchatClient:
     async def notification_handler(self, sender: BleakGATTCharacteristic, data: bytes, noRelay: bool = False):
         """Handle incoming BLE notifications"""
         # If Bluetooth transmission is disabled, skip receiving/processing
-        if self.disable_bluetooth_transmission:
+        if self.disable_bluetooth_transmission and (not noRelay):
             debug_println("[BT DISABLED] Skipping Bluetooth receive (BT receive disabled)")
             return
 
@@ -2854,7 +2854,6 @@ class BitchatClient:
 
     async def periodic_announcer(self):
         """Periodically re-broadcast identity + text ANNOUNCE (every 30s, matching Android)"""
-        return
         while self.running:
             await asyncio.sleep(30)
             if not self.running:
