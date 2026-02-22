@@ -2854,6 +2854,7 @@ class BitchatClient:
 
     async def periodic_announcer(self):
         """Periodically re-broadcast identity + text ANNOUNCE (every 30s, matching Android)"""
+        return
         while self.running:
             await asyncio.sleep(30)
             if not self.running:
@@ -3547,9 +3548,12 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
     return False
 
 
-async def main(fromLoRa = None,toLoRa = None):
+async def main(fromLoRa = None,toLoRa = None,disable_bluetooth = False):
     """Main entry point"""
     client = BitchatClient(fromLoRa,toLoRa)
+    client.disable_bluetooth_transmission = bool(disable_bluetooth)
+    if client.disable_bluetooth_transmission:
+        print("\033[93m[BT DISABLED] Bluetooth scanning/transmission is disabled (LoRa-only mode).\033[0m")
     await client.run()
 
 if __name__ == "__main__":
