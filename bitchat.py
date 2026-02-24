@@ -2893,7 +2893,7 @@ class BitchatClient:
                     self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                 )
                 announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
-                await self.send_packet(announce_packet)
+                await self.send_packet(announce_packet,False)  # Don't send to LoRa to reduce congestion
 
                 debug_println(f"[ANNOUNCE] Periodic re-announce sent")
             except Exception as e:
@@ -3044,6 +3044,7 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     try:
                         package = self.fromLoRa.get_nowait()
+                        print(parse_bitchat_packet(package))
                     except queue.Empty:
                         await asyncio.sleep(0.05)
                         continue
