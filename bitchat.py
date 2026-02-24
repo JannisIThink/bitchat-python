@@ -11,7 +11,7 @@ import hashlib
 import random
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Set
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
 import logging
@@ -220,6 +220,8 @@ class BitchatClient:
         # When True, all processing happens normally but actual BT send/receive is skipped
         self.disable_bluetooth_transmission: bool = False
         # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
+        self.announceStrategy = 0 #describes how often Announce messages are being sent or relayed over LoRa: 0 (default): all Announcements are being forwarded, 1: one Announcement per node every 5 minutes, 2: no Announcements at all (Signatures cant'b be validated in this mode, because the public keys are not available)
+        self.announceDict = defaultdict(lambda : time.time() - 20 * 60) #only used if announceStrategy == 1, stores the last announce timestamp for each peer ID to determine if a new announce should be sent/relayed
 
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
         self.encryption_service = EncryptionService(identity_path=_identity_path)
@@ -853,9 +855,28 @@ class BitchatClient:
         await self.send_packet(relay_bytes, via_lora=False)
 
         if (self.toLoRa is not None) and (not noRelay):
-            relay_data = bytearray(raw_data) # Transmit without decremented TTL, bc TTL wie be reduced by receiver's relay logic
-            relay_bytes = bytes(relay_data)
-            self.toLoRa.put(relay_bytes)
+            if self.shouldSendOverLoRa(packet):
+                relay_data = bytearray(raw_data) # Transmit without decremented TTL, bc TTL wie be reduced by receiver's relay logic
+                relay_bytes = bytes(relay_data)
+                self.toLoRa.put(relay_bytes)
+
+    def shouldSendOverLoRa(self,packet : BitchatPacket) -> bool:
+        if packet.msg_type == MessageType.ANNOUNCE:
+            if (self.announceStrategy == 0) or (self.announceStrategy == None):
+                return True
+            elif self.announceStrategy == 1:
+                if (time.time() - self.announceDict[packet.sender_id]) > (5 * 60):
+                    self.announceDict[packet.sender_id] = time.time()
+                    return True
+                else:
+                    return False
+            elif self.announceStrategy == 2:
+                return False
+            else:
+                raise Exception(f"Announce Strategy {self.announceStrategy} is currently not implemented!")
+        else:
+            return True
+
 
     async def handle_packet(self, packet: BitchatPacket, raw_data: bytes, noRelay : bool = False):
         """Handle incoming packet"""
@@ -2893,7 +2914,7 @@ class BitchatClient:
                     self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                 )
                 announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
-                await self.send_packet(announce_packet,False)  # Don't send to LoRa to reduce congestion
+                await self.send_packet(announce_packet,self.shouldSendOverLoRa(announce_packet)) #filter own announcements too
 
                 debug_println(f"[ANNOUNCE] Periodic re-announce sent")
             except Exception as e:
@@ -3548,10 +3569,11 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
     return False
 
 
-async def main(fromLoRa = None,toLoRa = None,disable_bluetooth = False):
+async def main(fromLoRa = None,toLoRa = None,disable_bluetooth = False,anounceStrategy = 0):
     """Main entry point"""
     client = BitchatClient(fromLoRa,toLoRa)
     client.disable_bluetooth_transmission = bool(disable_bluetooth)
+    client.announceStrategy = anounceStrategy
     if client.disable_bluetooth_transmission:
         print("\033[93m[BT DISABLED] Bluetooth scanning/transmission is disabled (LoRa-only mode).\033[0m")
     await client.run()
