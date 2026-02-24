@@ -862,6 +862,7 @@ class BitchatClient:
 
     def shouldSendOverLoRa(self,packet : BitchatPacket) -> bool:
         if packet.msg_type == MessageType.ANNOUNCE:
+            print("aS: ",self.announceStrategy)
             if (self.announceStrategy == 0) or (self.announceStrategy == None):
                 return True
             elif self.announceStrategy == 1:
