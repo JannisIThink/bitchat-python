@@ -383,18 +383,21 @@ class BitchatClient:
         """Scan for BitChat service"""
         debug_println("[1] Scanning for bitchat service...")
 
-        # First attempt: filtered discover by service UUID (fast on platforms that expose UUIDs in advertisement)
+        # Single scan pass — BlueZ on Linux can fail with 'br-connection-canceled'
+        # if we chain multiple discover() calls, because the scanner teardown
+        # hasn't finished by the time the next scan or connect starts.
         try:
-            devices = await BleakScanner.discover(timeout=5.0, service_uuids=[BITCHAT_SERVICE_UUID])
+            all_devices = await BleakScanner.discover(timeout=5.0, service_uuids=[BITCHAT_SERVICE_UUID])
         except Exception:
-            devices = []
+            all_devices = []
 
-        for device in devices:
+        for device in all_devices:
             debug_full_println(f"Found device (filtered): {device.name} - {device.address}")
             return device
 
-        # Second attempt: scan all devices and inspect advertisement metadata and name
-        debug_full_println("No devices found with UUID filter, scanning all advertisements...")
+        # Filtered scan found nothing — try an unfiltered scan as fallback.
+        # On some Linux + BlueZ combos the service UUID isn't visible via the
+        # advertisement filter, so we fall back to name / metadata matching.
         try:
             all_devices = await BleakScanner.discover(timeout=5.0)
         except Exception:
@@ -504,55 +507,72 @@ class BitchatClient:
         print("\033[90m» Found bitchat service! Connecting...\033[0m")
         debug_println("[1] Match Found! Connecting...")
 
+        # BlueZ on Linux needs time to fully tear down the scanner before a
+        # new BLE connection can be established.  Without this pause the
+        # connect() call races with the scanner teardown and BlueZ responds
+        # with 'br-connection-canceled'.
+        await asyncio.sleep(1.5)
+
         self._connecting = True
-        try:
-            self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
-            await self.client.connect(timeout=15.0)
-
-            # Android GATT server needs ~1s after STATE_CONNECTED (internal
-            # 1000ms delay) before it is fully ready.  Writing to the
-            # characteristic too early can silently drop the connection.
-            await asyncio.sleep(1.0)
-            if not self.client.is_connected:
-                raise Exception("Connection dropped during stabilization")
-
-            # Find characteristic
-            services = self.client.services
-            if not services:
-                raise Exception("No services found on device")
-
-            for service in services:
-                for char in service.characteristics:
-                    if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
-                        self.characteristic = char
-                        debug_println(f"[2] Found characteristic: {char.uuid}")
-                        break
-                if self.characteristic:
-                    break
-
-            if not self.characteristic:
-                raise Exception("Characteristic not found")
-
-            # Subscribe to notifications
-            await self.client.start_notify(self.characteristic, self.notification_handler)
-
-            debug_println("[2] Connection established.")
-            return True
-
-        except Exception as e:
-            print(f"\n\033[91m❌ Connection failed\033[0m")
-            print(f"\033[90mReason: {e}\033[0m")
-            # Clean up the failed client so the disconnect callback doesn't fire later
+        max_connect_retries = 3
+        for attempt in range(max_connect_retries):
             try:
-                if self.client and self.client.is_connected:
-                    await self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
-            self.characteristic = None
-            return False
-        finally:
-            self._connecting = False
+                self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
+                await self.client.connect(timeout=15.0)
+
+                # Android GATT server needs ~1s after STATE_CONNECTED (internal
+                # 1000ms delay) before it is fully ready.  Writing to the
+                # characteristic too early can silently drop the connection.
+                await asyncio.sleep(1.0)
+                if not self.client.is_connected:
+                    raise Exception("Connection dropped during stabilization")
+
+                # Find characteristic
+                services = self.client.services
+                if not services:
+                    raise Exception("No services found on device")
+
+                for service in services:
+                    for char in service.characteristics:
+                        if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
+                            self.characteristic = char
+                            debug_println(f"[2] Found characteristic: {char.uuid}")
+                            break
+                    if self.characteristic:
+                        break
+
+                if not self.characteristic:
+                    raise Exception("Characteristic not found")
+
+                # Subscribe to notifications
+                await self.client.start_notify(self.characteristic, self.notification_handler)
+
+                debug_println("[2] Connection established.")
+                self._connecting = False
+                return True
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_retryable = "canceled" in error_str or "stabilization" in error_str
+                # Clean up the failed client
+                try:
+                    if self.client and self.client.is_connected:
+                        await self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+                self.characteristic = None
+
+                if is_retryable and attempt < max_connect_retries - 1:
+                    debug_println(f"[BLE] Connect attempt {attempt + 1} failed ({e}), retrying...")
+                    await asyncio.sleep(2.0)
+                    continue
+                else:
+                    print(f"\n\033[91m❌ Connection failed\033[0m")
+                    print(f"\033[90mReason: {e}\033[0m")
+                    return False
+        self._connecting = False
+        return False
 
     async def handshake(self):
         """Perform initial handshake"""
@@ -3038,7 +3058,7 @@ class BitchatClient:
                 # Exponential backoff: wait longer after consecutive failures
                 # to avoid spamming connect attempts on flaky BLE links
                 if self._consecutive_failures > 0:
-                    backoff = min(2 ** self._consecutive_failures, 30)  # 2s, 4s, 8s, … max 30s
+                    backoff = min(2 ** self._consecutive_failures, 15)  # 2s, 4s, 8s, max 15s
                     debug_println(f"[SCANNER] Backoff {backoff}s after {self._consecutive_failures} consecutive failures")
                     await asyncio.sleep(backoff)
 
@@ -3046,30 +3066,66 @@ class BitchatClient:
                 device = await self.find_device()
                 if device:
                     print(f"\r\033[K\033[92m» Found a BitChat device! Connecting...\033[0m")
+
+                    # BlueZ needs time to tear down the scanner before we can
+                    # connect without 'br-connection-canceled'.  Give it a
+                    # generous pause.
+                    await asyncio.sleep(1.5)
+
+                    # Reset characteristic in case it's stale from a previous connection
+                    self.characteristic = None
+
                     self._connecting = True
-                    try:
-                        self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
-                        await self.client.connect(timeout=15.0)
+                    connect_ok = False
+                    for _attempt in range(3):
+                        try:
+                            self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
+                            await self.client.connect(timeout=15.0)
 
-                        # Android GATT server needs ~1s after STATE_CONNECTED
-                        # (internal 1000ms delay) before it is fully ready.
-                        await asyncio.sleep(1.0)
-                        if not self.client.is_connected:
-                            raise Exception("Connection dropped during stabilization")
+                            # Android GATT server needs ~1s after STATE_CONNECTED
+                            # (internal 1000ms delay) before it is fully ready.
+                            await asyncio.sleep(1.0)
+                            if not self.client.is_connected:
+                                raise Exception("Connection dropped during stabilization")
 
-                        # Find characteristic
-                        services = self.client.services
-                        for service in services:
-                            for char in service.characteristics:
-                                if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
-                                    self.characteristic = char
+                            # Find characteristic
+                            services = self.client.services
+                            for service in services:
+                                for char in service.characteristics:
+                                    if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
+                                        self.characteristic = char
+                                        break
+                                if self.characteristic:
                                     break
-                            if self.characteristic:
-                                break
 
-                        if not self.characteristic:
-                            raise Exception("Characteristic not found")
+                            if not self.characteristic:
+                                raise Exception("Characteristic not found")
 
+                            connect_ok = True
+                            break  # success — exit retry loop
+
+                        except Exception as e:
+                            error_str = str(e).lower()
+                            is_retryable = "canceled" in error_str or "stabilization" in error_str
+                            try:
+                                if self.client and self.client.is_connected:
+                                    await self.client.disconnect()
+                            except Exception:
+                                pass
+                            self.client = None
+                            self.characteristic = None
+
+                            if is_retryable and _attempt < 2:
+                                debug_println(f"[SCANNER] Connect attempt {_attempt + 1} failed ({e}), retrying...")
+                                await asyncio.sleep(2.0)
+                                continue
+                            else:
+                                raise  # re-raise to outer except block
+
+                    if not connect_ok:
+                        raise Exception("Connection failed after retries")
+
+                    try:
                         # Subscribe to notifications
                         await self.client.start_notify(self.characteristic, self.notification_handler)
                         print(f"\r\033[K\033[92m✓ Connected to BitChat network!\033[0m")
@@ -3091,12 +3147,10 @@ class BitchatClient:
                             public_key_bytes = self.encryption_service.get_public_key()
                             signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
 
-                            # Create binding data for signature
                             timestamp_data = str(timestamp_ms).encode('utf-8')
                             binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
                             signature = self.encryption_service.sign_data(binding_data)
 
-                            # Encode to binary format
                             identity_payload = self.encode_noise_identity_announcement_binary(
                                 self.my_peer_id, public_key_bytes, signing_public_key_bytes,
                                 self.nickname, timestamp_ms, signature
@@ -3109,7 +3163,6 @@ class BitchatClient:
                             await self.send_packet(identity_packet)
                         except Exception as e:
                             debug_println(f"[SCANNER] Failed to send identity: {e}")
-                            # Fallback
                             key_exchange_payload = self.encryption_service.get_combined_public_key_data()
                             key_exchange_packet = create_bitchat_packet(
                                 self.my_peer_id, MessageType.NOISE_HANDSHAKE, key_exchange_payload
@@ -3125,19 +3178,12 @@ class BitchatClient:
                         await self.send_packet(announce_packet)
 
                         print("> ", end='', flush=True)
-                        # Reset failure counter on successful connection
                         self._consecutive_failures = 0
 
-                        # Android does NOT auto-initiate Noise handshake when it
-                        # receives an announce.  Schedule a safety-net task that
-                        # waits for Android's announce to arrive, then makes sure
-                        # we have initiated a handshake with every known peer.
                         asyncio.create_task(self._post_connect_handshake())
                     except Exception as e:
                         print(f"\r\033[K\033[93m» Connection attempt failed: {e}\033[0m")
                         debug_println(f"[SCANNER] Connection attempt failed: {e}")
-                        # Clean up the failed client properly WHILE still in _connecting state
-                        # so that the disconnected_callback is suppressed during cleanup.
                         try:
                             if self.client and self.client.is_connected:
                                 await self.client.disconnect()
