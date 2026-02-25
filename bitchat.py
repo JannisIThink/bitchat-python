@@ -380,56 +380,52 @@ class BitchatClient:
                 debug_println(f"[NOISE] Post-connect handshake failed for {peer_id}: {e}")
 
     async def find_device(self) -> Optional[BLEDevice]:
-        """Scan for BitChat service"""
+        """Scan for BitChat service.
+
+        Uses a single UNFILTERED scan and inspects the AdvertisementData
+        returned by Bleak.  This avoids two problems on Linux/BlueZ:
+          1) SetDiscoveryFilter with 128-bit UUIDs is unreliable on many
+             BlueZ versions.
+          2) Running two sequential BleakScanner.discover() calls causes
+             D-Bus scanner teardown races that can silently swallow results
+             or trigger 'br-connection-canceled' on the subsequent connect.
+        """
         debug_println("[1] Scanning for bitchat service...")
 
-        # Single scan pass — BlueZ on Linux can fail with 'br-connection-canceled'
-        # if we chain multiple discover() calls, because the scanner teardown
-        # hasn't finished by the time the next scan or connect starts.
+        target_norm = BITCHAT_SERVICE_UUID.replace('-', '').lower()
+
         try:
-            all_devices = await BleakScanner.discover(timeout=5.0, service_uuids=[BITCHAT_SERVICE_UUID])
-        except Exception:
-            all_devices = []
+            # return_adv=True → dict[str, tuple[BLEDevice, AdvertisementData]]
+            results = await BleakScanner.discover(timeout=5.0, return_adv=True)
+        except Exception as e:
+            debug_println(f"[SCAN] discover() failed: {e}")
+            return None
 
-        for device in all_devices:
-            debug_full_println(f"Found device (filtered): {device.name} - {device.address}")
-            return device
+        for address, (device, adv_data) in results.items():
+            debug_full_println(
+                f"Advert: name={adv_data.local_name} addr={address} "
+                f"svc_uuids={adv_data.service_uuids} "
+                f"svc_data_keys={list(adv_data.service_data.keys()) if adv_data.service_data else []}"
+            )
 
-        # Filtered scan found nothing — try an unfiltered scan as fallback.
-        # On some Linux + BlueZ combos the service UUID isn't visible via the
-        # advertisement filter, so we fall back to name / metadata matching.
-        try:
-            all_devices = await BleakScanner.discover(timeout=5.0)
-        except Exception:
-            all_devices = []
-
-        def _normalize_uuid(u: str) -> str:
-            return u.replace('-', '').lower()
-
-        target_norm = _normalize_uuid(BITCHAT_SERVICE_UUID)
-
-        for device in all_devices:
-            debug_full_println(f"Advert: name={device.name} address={device.address} metadata={getattr(device, 'metadata', {})}")
-
-            # 1) Match by friendly name
-            try:
-                if device.name and 'bitchat' in device.name.lower():
-                    debug_full_println(f"Matched by name: {device.name}")
+            # 1) Match by advertised service UUIDs (most reliable)
+            for u in (adv_data.service_uuids or []):
+                if u.replace('-', '').lower() == target_norm:
+                    debug_println(f"[SCAN] Matched by service UUID: {address}")
                     return device
-            except Exception:
-                pass
 
-            # 2) Match by advertised UUIDs in metadata (normalize forms)
-            md = getattr(device, 'metadata', {}) or {}
-            uuids = md.get('uuids') or md.get('uuids', [])
-            if uuids:
-                for u in uuids:
-                    try:
-                        if _normalize_uuid(u) == target_norm:
-                            debug_full_println(f"Matched by advertised UUID on {device.address}")
-                            return device
-                    except Exception:
-                        continue
+            # 2) Match by service-data key (Android puts peer-ID bytes here)
+            if adv_data.service_data:
+                for u in adv_data.service_data.keys():
+                    if u.replace('-', '').lower() == target_norm:
+                        debug_println(f"[SCAN] Matched by service-data key: {address}")
+                        return device
+
+            # 3) Fallback: device name contains 'bitchat'
+            name = adv_data.local_name or device.name or ""
+            if name and 'bitchat' in name.lower():
+                debug_println(f"[SCAN] Matched by name '{name}': {address}")
+                return device
 
         # Nothing found
         return None
@@ -570,6 +566,7 @@ class BitchatClient:
                 else:
                     print(f"\n\033[91m❌ Connection failed\033[0m")
                     print(f"\033[90mReason: {e}\033[0m")
+                    self._connecting = False
                     return False
         self._connecting = False
         return False
@@ -3077,61 +3074,76 @@ class BitchatClient:
 
                     self._connecting = True
                     connect_ok = False
-                    for _attempt in range(3):
-                        try:
-                            self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
-                            await self.client.connect(timeout=15.0)
-
-                            # Android GATT server needs ~1s after STATE_CONNECTED
-                            # (internal 1000ms delay) before it is fully ready.
-                            await asyncio.sleep(1.0)
-                            if not self.client.is_connected:
-                                raise Exception("Connection dropped during stabilization")
-
-                            # Find characteristic
-                            services = self.client.services
-                            for service in services:
-                                for char in service.characteristics:
-                                    if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
-                                        self.characteristic = char
-                                        break
-                                if self.characteristic:
-                                    break
-
-                            if not self.characteristic:
-                                raise Exception("Characteristic not found")
-
-                            connect_ok = True
-                            break  # success — exit retry loop
-
-                        except Exception as e:
-                            error_str = str(e).lower()
-                            is_retryable = "canceled" in error_str or "stabilization" in error_str
+                    try:
+                        for _attempt in range(3):
                             try:
-                                if self.client and self.client.is_connected:
-                                    await self.client.disconnect()
-                            except Exception:
-                                pass
-                            self.client = None
-                            self.characteristic = None
+                                self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
+                                await self.client.connect(timeout=15.0)
 
-                            if is_retryable and _attempt < 2:
-                                debug_println(f"[SCANNER] Connect attempt {_attempt + 1} failed ({e}), retrying...")
-                                await asyncio.sleep(2.0)
-                                continue
-                            else:
-                                raise  # re-raise to outer except block
+                                # Android GATT server needs ~1s after STATE_CONNECTED
+                                # (internal 1000ms delay) before it is fully ready.
+                                await asyncio.sleep(1.0)
+                                if not self.client.is_connected:
+                                    raise Exception("Connection dropped during stabilization")
 
-                    if not connect_ok:
-                        raise Exception("Connection failed after retries")
+                                # Find characteristic
+                                services = self.client.services
+                                for service in services:
+                                    for char in service.characteristics:
+                                        if char.uuid.lower() == BITCHAT_CHARACTERISTIC_UUID.lower():
+                                            self.characteristic = char
+                                            break
+                                    if self.characteristic:
+                                        break
 
+                                if not self.characteristic:
+                                    raise Exception("Characteristic not found")
+
+                                connect_ok = True
+                                break  # success — exit retry loop
+
+                            except Exception as e:
+                                error_str = str(e).lower()
+                                is_retryable = "canceled" in error_str or "stabilization" in error_str
+                                try:
+                                    if self.client and self.client.is_connected:
+                                        await self.client.disconnect()
+                                except Exception:
+                                    pass
+                                self.client = None
+                                self.characteristic = None
+
+                                if is_retryable and _attempt < 2:
+                                    debug_println(f"[SCANNER] Connect attempt {_attempt + 1} failed ({e}), retrying...")
+                                    await asyncio.sleep(2.0)
+                                    continue
+                                else:
+                                    raise  # propagate to outer handler
+
+                        if not connect_ok:
+                            raise Exception("Connection failed after retries")
+                    except Exception as e:
+                        # Catch-all so the background scanner never dies
+                        print(f"\r\033[K\033[93m» Connection to {device.address} failed: {e}\033[0m")
+                        debug_println(f"[SCANNER] Connection failed: {e}")
+                        try:
+                            if self.client and self.client.is_connected:
+                                await self.client.disconnect()
+                        except Exception:
+                            pass
+                        self.client = None
+                        self.characteristic = None
+                        self._connecting = False
+                        self._consecutive_failures += 1
+                        await asyncio.sleep(5)
+                        continue  # skip to next loop iteration
+
+                    # --- Connection succeeded, now subscribe + handshake ---
+                    self._connecting = False
                     try:
                         # Subscribe to notifications
                         await self.client.start_notify(self.characteristic, self.notification_handler)
                         print(f"\r\033[K\033[92m✓ Connected to BitChat network!\033[0m")
-
-                        # Mark connection setup as done BEFORE sending announcements
-                        self._connecting = False
 
                         # Clear any stale peers from previous connection
                         self.peers.clear()
@@ -3182,8 +3194,8 @@ class BitchatClient:
 
                         asyncio.create_task(self._post_connect_handshake())
                     except Exception as e:
-                        print(f"\r\033[K\033[93m» Connection attempt failed: {e}\033[0m")
-                        debug_println(f"[SCANNER] Connection attempt failed: {e}")
+                        print(f"\r\033[K\033[93m» Post-connect setup failed: {e}\033[0m")
+                        debug_println(f"[SCANNER] Post-connect setup failed: {e}")
                         try:
                             if self.client and self.client.is_connected:
                                 await self.client.disconnect()
@@ -3192,7 +3204,6 @@ class BitchatClient:
                         self.client = None
                         self.characteristic = None
                         self._consecutive_failures += 1
-                        self._connecting = False
 
             # Wait before next scan
             await asyncio.sleep(5)  # Scan every 5 seconds when not connected
