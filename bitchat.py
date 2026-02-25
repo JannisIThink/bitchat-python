@@ -222,6 +222,7 @@ class BitchatClient:
         # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
         self.announceStrategy = 0 #describes how often Announce messages are being sent or relayed over LoRa: 0 (default): all Announcements are being forwarded, 1: one Announcement per node every 5 minutes, 2: no Announcements at all (Signatures cant'b be validated in this mode, because the public keys are not available)
         self.announceDict = defaultdict(lambda : time.time() - 20 * 60) #only used if announceStrategy == 1, stores the last announce timestamp for each peer ID to determine if a new announce should be sent/relayed
+        self.noPadding = False #if True, messages will be unpadded before transmission over LoRa. This makes traffic analysis easier but improves transmission speed.
 
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
         self.encryption_service = EncryptionService(identity_path=_identity_path)
@@ -297,6 +298,15 @@ class BitchatClient:
                 asyncio.create_task(self.send_packet(bytes(handshake_data)))
             except Exception as e:
                 debug_println(f"[NOISE] Failed to initiate rekey handshake: {e}")
+
+    def putInToLoRaQueue(self,packet :bytes):
+        """Put a packet into the toLoRa queue if it exists"""
+        if self.noPadding:
+            unpaded = unpad_packet(packet)
+            if unpaded:
+                self.toLoRa.put(unpaded)
+        elif packet:
+            self.toLoRa.put(packet)
 
     async def send_pending_private_messages(self, peer_id: str):
         """Send all pending private messages for a peer after handshake completes"""
@@ -674,9 +684,11 @@ class BitchatClient:
                 if parsed and not self.shouldSendOverLoRa(parsed):
                     debug_println(f"[LORA] Skipping ANNOUNCE over LoRa (announceStrategy={self.announceStrategy})")
                 else:
-                    self.toLoRa.put(packet)
+                    self.putInToLoRaQueue(packet)
+                    #self.toLoRa.put(packet)
             else:
-                self.toLoRa.put(packet)
+                self.putInToLoRaQueue(packet)
+                #self.toLoRa.put(packet)
 
         # If Bluetooth transmission is disabled, skip BLE send
         if self.disable_bluetooth_transmission:
@@ -941,7 +953,8 @@ class BitchatClient:
             if self.shouldSendOverLoRa(packet):
                 relay_data = bytearray(raw_data) # Transmit without decremented TTL, bc TTL wie be reduced by receiver's relay logic
                 relay_bytes = bytes(relay_data)
-                self.toLoRa.put(relay_bytes)
+                self.putInToLoRaQueue(relay_bytes)
+                #self.toLoRa.put(relay_bytes)
 
     def shouldSendOverLoRa(self, packet: 'BitchatPacket') -> bool:
         """Decide whether a packet should be sent/relayed over LoRa.
@@ -3227,14 +3240,14 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     try:
                         package = self.fromLoRa.get_nowait()
-                        print(parse_bitchat_packet(package))
+                        #print(parse_bitchat_packet(package))
                     except queue.Empty:
                         await asyncio.sleep(0.05)
                         continue
-                    print(f"[LORA] Received package from queue: {len(package)} bytes, first bytes: {package[:20].hex() if len(package) >= 20 else package.hex()}")
+                    #print(f"[LORA] Received package from queue: {len(package)} bytes, first bytes: {package[:20].hex() if len(package) >= 20 else package.hex()}")
                     try:
                         await self.notification_handler(None,package,True)
-                        print(f"[LORA] Package processed successfully")
+                        #print(f"[LORA] Package processed successfully")
                     except Exception as e:
                         print(f"[LORA] Error processing LoRa packet: {e}")
                         print(f"[LORA] Traceback: {traceback.format_exc()}")
@@ -3731,11 +3744,12 @@ def should_send_ack(is_private: bool, channel: Optional[str], mentions: Optional
     return False
 
 
-async def main(fromLoRa = None,toLoRa = None,disable_bluetooth = False,anounceStrategy = 0):
+async def main(fromLoRa = None,toLoRa = None,disable_bluetooth = False,anounceStrategy = 0,noPadding=False):
     """Main entry point"""
     client = BitchatClient(fromLoRa,toLoRa)
     client.disable_bluetooth_transmission = bool(disable_bluetooth)
     client.announceStrategy = anounceStrategy
+    client.noPadding = noPadding
     if client.disable_bluetooth_transmission:
         print("\033[93m[BT DISABLED] Bluetooth scanning/transmission is disabled (LoRa-only mode).\033[0m")
     await client.run()
