@@ -328,6 +328,32 @@ class BitchatClient:
                     # Don't retry immediately, let it retry later
                     break
 
+    async def _delayed_handshake_fallback(self, peer_id: str, delay: float = 10.0):
+        """Fallback: if the preferred (lower-ID) side didn't initiate within *delay*
+        seconds, we (higher-ID side) initiate ourselves so the handshake doesn't stall.
+        This covers the case where the lower-ID side never received our announce or is
+        unreachable via the path we expected."""
+        await asyncio.sleep(delay)
+        # Only initiate if we still don't have a session AND no handshake in progress
+        if self.encryption_service.is_session_established(peer_id):
+            return
+        if peer_id in self.encryption_service.handshake_states:
+            return
+        if peer_id not in self.peers:
+            return
+        debug_println(f"[NOISE] Fallback: no session with {peer_id} after {delay}s — initiating handshake from higher-ID side")
+        try:
+            handshake_message = self.encryption_service.initiate_handshake(peer_id)
+            handshake_packet = create_bitchat_packet_with_recipient(
+                self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
+            )
+            handshake_data = bytearray(handshake_packet)
+            handshake_data[2] = 7
+            await self.send_packet(bytes(handshake_data))
+            debug_println(f"[NOISE] Sent fallback handshake init to {peer_id}")
+        except Exception as e:
+            debug_println(f"[NOISE] Fallback handshake initiation failed for {peer_id}: {e}")
+
     async def find_device(self) -> Optional[BLEDevice]:
         """Scan for BitChat service"""
         debug_println("[1] Scanning for bitchat service...")
@@ -593,7 +619,15 @@ class BitchatClient:
         # Always send via LoRa first, regardless of BLE state.
         # LoRa transmission must not depend on whether BLE is connected.
         if via_lora and self.toLoRa is not None:
-            self.toLoRa.put(packet)
+            # Apply announceStrategy filtering for ANNOUNCE packets (central check)
+            if len(packet) >= 2 and packet[1] == MessageType.ANNOUNCE.value:
+                parsed = parse_bitchat_packet(packet)
+                if parsed and not self.shouldSendOverLoRa(parsed):
+                    debug_println(f"[LORA] Skipping ANNOUNCE over LoRa (announceStrategy={self.announceStrategy})")
+                else:
+                    self.toLoRa.put(packet)
+            else:
+                self.toLoRa.put(packet)
 
         # If Bluetooth transmission is disabled, skip BLE send
         if self.disable_bluetooth_transmission:
@@ -982,12 +1016,11 @@ class BitchatClient:
                     )
                     await self.send_packet(key_exchange_packet)
             else:
-                # We have higher ID — Android PrivateChatManager still initiates
-                # from the higher side as well, so both sides try.  The
-                # SecurityManager resolves the resulting race.
-                debug_println(f"[CRYPTO] Also initiating Noise handshake with {packet.sender_id_str} (higher-ID side, matching Android behaviour)")
+                # We have higher ID — send targeted identity announce to prompt the
+                # lower-ID side (the preferred initiator) to start the handshake.
+                # If no session is established after a timeout, we initiate as fallback.
+                debug_println(f"[CRYPTO] Sending targeted identity announce to {packet.sender_id_str} (they have lower ID, prompting them to initiate)")
                 try:
-                    # Send targeted identity announce first so they know us
                     timestamp_ms = int(time.time() * 1000)
                     public_key_bytes = self.encryption_service.get_public_key()
                     signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
@@ -1007,21 +1040,13 @@ class BitchatClient:
                     )
                     identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                     await self.send_packet(identity_packet)
-
-                    await asyncio.sleep(0.3)
-
-                    # Now also initiate handshake (Android does this unconditionally)
-                    handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
-                    handshake_packet = create_bitchat_packet_with_recipient(
-                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
-                    )
-                    handshake_data = bytearray(handshake_packet)
-                    handshake_data[2] = 7
-                    handshake_packet = bytes(handshake_data)
-                    await self.send_packet(handshake_packet)
-                    debug_println(f"[NOISE] Sent handshake init to {packet.sender_id_str} (higher-ID side)")
                 except Exception as e:
-                    debug_println(f"[CRYPTO] Failed to send targeted identity announce / handshake: {e}")
+                    debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
+
+                # Delayed fallback: if the lower-ID side doesn't initiate within
+                # a reasonable window, WE initiate so the handshake doesn't stall.
+                peer_id_for_fallback = packet.sender_id_str
+                asyncio.create_task(self._delayed_handshake_fallback(peer_id_for_fallback))
 
         # Relay ANNOUNCE if TTL > 1 (matching Android PacketRelayManager)
         await self._relay_packet(packet, raw_data, noRelay)
@@ -1259,17 +1284,13 @@ class BitchatClient:
             debug_println(f"[NOISE] Received new handshake from {sender} with existing session — dropping old session to re-handshake (matching Android)")
             self.encryption_service.remove_session(sender)
 
+        # Android NoiseSessionManager: "no tie breaker, just start" — when receiving
+        # an init while we have ANY existing handshake state (initiator OR responder),
+        # unconditionally drop it and let process_handshake_message create a fresh
+        # responder.  This resolves races where both sides initiate simultaneously.
         if is_init_message and sender in self.encryption_service.handshake_states:
-            existing_hs = self.encryption_service.handshake_states[sender]
-            if existing_hs.role == NoiseRole.INITIATOR:
-                if self.my_peer_id < sender:
-                    # We have lower ID → we are the rightful initiator → ignore their init
-                    debug_println(f"[NOISE] Race condition: ignoring handshake init from {sender} (we have lower ID, we are initiator)")
-                    return
-                else:
-                    # They have lower ID → they should be initiator → drop our state, accept theirs
-                    debug_println(f"[NOISE] Race condition: dropping our initiator state for {sender} (they have lower ID)")
-                    self.encryption_service.clear_handshake_state(sender)
+            debug_println(f"[NOISE] Dropping existing handshake state for {sender} to accept their init (matching Android: no tie-breaker)")
+            self.encryption_service.clear_handshake_state(sender)
 
         debug_println(f"[NOISE] Handshake payload size: {payload_size} bytes")
         debug_println(f"[NOISE] Handshake payload hex (full): {packet.payload.hex()}")
