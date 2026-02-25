@@ -328,7 +328,7 @@ class BitchatClient:
                     # Don't retry immediately, let it retry later
                     break
 
-    async def _delayed_handshake_fallback(self, peer_id: str, delay: float = 10.0):
+    async def _delayed_handshake_fallback(self, peer_id: str, delay: float = 3.0):
         """Fallback: if the preferred (lower-ID) side didn't initiate within *delay*
         seconds, we (higher-ID side) initiate ourselves so the handshake doesn't stall.
         This covers the case where the lower-ID side never received our announce or is
@@ -353,6 +353,31 @@ class BitchatClient:
             debug_println(f"[NOISE] Sent fallback handshake init to {peer_id}")
         except Exception as e:
             debug_println(f"[NOISE] Fallback handshake initiation failed for {peer_id}: {e}")
+
+    async def _post_connect_handshake(self):
+        """Safety-net after a fresh BLE connection: wait for the remote peer's
+        announce to arrive, then ensure a Noise handshake has been initiated
+        with every discovered peer that doesn't yet have a session."""
+        await asyncio.sleep(3.0)  # Give Android time to send its announce + process ours
+        if not self.client or not self.running:
+            return
+        for peer_id in list(self.peers.keys()):
+            if self.encryption_service.is_session_established(peer_id):
+                continue
+            if peer_id in self.encryption_service.handshake_states:
+                continue  # Handshake already in progress
+            debug_println(f"[NOISE] Post-connect: no session/handshake with {peer_id}, initiating")
+            try:
+                handshake_message = self.encryption_service.initiate_handshake(peer_id)
+                handshake_packet = create_bitchat_packet_with_recipient(
+                    self.my_peer_id, peer_id, MessageType.NOISE_HANDSHAKE, handshake_message, None
+                )
+                handshake_data = bytearray(handshake_packet)
+                handshake_data[2] = 7
+                await self.send_packet(bytes(handshake_data))
+                debug_println(f"[NOISE] Post-connect: sent handshake init to {peer_id}")
+            except Exception as e:
+                debug_println(f"[NOISE] Post-connect handshake failed for {peer_id}: {e}")
 
     async def find_device(self) -> Optional[BLEDevice]:
         """Scan for BitChat service"""
@@ -482,10 +507,12 @@ class BitchatClient:
         self._connecting = True
         try:
             self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
-            await self.client.connect()
+            await self.client.connect(timeout=15.0)
 
-            # Small stabilization delay — some BLE peripherals drop immediately
-            await asyncio.sleep(0.3)
+            # Android GATT server needs ~1s after STATE_CONNECTED (internal
+            # 1000ms delay) before it is fully ready.  Writing to the
+            # characteristic too early can silently drop the connection.
+            await asyncio.sleep(1.0)
             if not self.client.is_connected:
                 raise Exception("Connection dropped during stabilization")
 
@@ -586,6 +613,11 @@ class BitchatClient:
             await self.send_packet(announce_packet)
 
             debug_println("[3] Handshake sent. You can now chat.")
+
+            # Android does NOT auto-initiate Noise handshake on announce.
+            # Schedule proactive handshake initiation after Android has time
+            # to send its announce back to us.
+            asyncio.create_task(self._post_connect_handshake())
         else:
             debug_println("[3] No connection yet. Skipping handshake.")
             print("\033[90m» Running in offline mode. Waiting for peers...\033[0m")
@@ -1016,10 +1048,10 @@ class BitchatClient:
                     )
                     await self.send_packet(key_exchange_packet)
             else:
-                # We have higher ID — send targeted identity announce to prompt the
-                # lower-ID side (the preferred initiator) to start the handshake.
-                # If no session is established after a timeout, we initiate as fallback.
-                debug_println(f"[CRYPTO] Sending targeted identity announce to {packet.sender_id_str} (they have lower ID, prompting them to initiate)")
+                # We have higher ID — matching Android PrivateChatManager: both
+                # sides always call initiateHandshake().  Send targeted identity
+                # announce first so the peer knows us, then initiate handshake.
+                debug_println(f"[CRYPTO] Higher-ID side: sending announce + initiating handshake with {packet.sender_id_str} (matching Android)")
                 try:
                     timestamp_ms = int(time.time() * 1000)
                     public_key_bytes = self.encryption_service.get_public_key()
@@ -1040,13 +1072,23 @@ class BitchatClient:
                     )
                     identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                     await self.send_packet(identity_packet)
-                except Exception as e:
-                    debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
 
-                # Delayed fallback: if the lower-ID side doesn't initiate within
-                # a reasonable window, WE initiate so the handshake doesn't stall.
-                peer_id_for_fallback = packet.sender_id_str
-                asyncio.create_task(self._delayed_handshake_fallback(peer_id_for_fallback))
+                    await asyncio.sleep(0.3)
+
+                    # Also initiate handshake (Android does this unconditionally)
+                    handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
+                    handshake_packet = create_bitchat_packet_with_recipient(
+                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
+                    )
+                    handshake_data = bytearray(handshake_packet)
+                    handshake_data[2] = 7
+                    handshake_packet = bytes(handshake_data)
+                    await self.send_packet(handshake_packet)
+                    debug_println(f"[NOISE] Sent handshake init to {packet.sender_id_str} (higher-ID side)")
+                except Exception as e:
+                    debug_println(f"[CRYPTO] Failed to send announce/handshake: {e}")
+                    # Schedule delayed fallback in case the above partially failed
+                    asyncio.create_task(self._delayed_handshake_fallback(packet.sender_id_str))
 
         # Relay ANNOUNCE if TTL > 1 (matching Android PacketRelayManager)
         await self._relay_packet(packet, raw_data, noRelay)
@@ -3007,10 +3049,11 @@ class BitchatClient:
                     self._connecting = True
                     try:
                         self.client = BleakClient(device.address, disconnected_callback=self.handle_disconnect)
-                        await self.client.connect()
+                        await self.client.connect(timeout=15.0)
 
-                        # Small stabilization delay — some BLE peripherals drop immediately
-                        await asyncio.sleep(0.3)
+                        # Android GATT server needs ~1s after STATE_CONNECTED
+                        # (internal 1000ms delay) before it is fully ready.
+                        await asyncio.sleep(1.0)
                         if not self.client.is_connected:
                             raise Exception("Connection dropped during stabilization")
 
@@ -3036,6 +3079,11 @@ class BitchatClient:
 
                         # Clear any stale peers from previous connection
                         self.peers.clear()
+
+                        # Android processes the CCCD subscription and then waits
+                        # ~100-200ms more before it considers the link ready.
+                        # Give it time before we send our first packet.
+                        await asyncio.sleep(1.0)
 
                         # Send Noise identity announcement
                         try:
@@ -3079,7 +3127,14 @@ class BitchatClient:
                         print("> ", end='', flush=True)
                         # Reset failure counter on successful connection
                         self._consecutive_failures = 0
+
+                        # Android does NOT auto-initiate Noise handshake when it
+                        # receives an announce.  Schedule a safety-net task that
+                        # waits for Android's announce to arrive, then makes sure
+                        # we have initiated a handshake with every known peer.
+                        asyncio.create_task(self._post_connect_handshake())
                     except Exception as e:
+                        print(f"\r\033[K\033[93m» Connection attempt failed: {e}\033[0m")
                         debug_println(f"[SCANNER] Connection attempt failed: {e}")
                         # Clean up the failed client properly WHILE still in _connecting state
                         # so that the disconnected_callback is suppressed during cleanup.
