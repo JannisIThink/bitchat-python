@@ -860,14 +860,17 @@ class BitchatClient:
                 relay_bytes = bytes(relay_data)
                 self.toLoRa.put(relay_bytes)
 
-    def shouldSendOverLoRa(self,packet : BitchatPacket) -> bool:
+    def shouldSendOverLoRa(self, packet: 'BitchatPacket') -> bool:
+        """Decide whether a packet should be sent/relayed over LoRa.
+        Accepts a BitchatPacket object (not raw bytes)."""
+        if packet is None:
+            return True
         if packet.msg_type == MessageType.ANNOUNCE:
-            print("aS: ",self.announceStrategy)
-            if (self.announceStrategy == 0) or (self.announceStrategy == None):
+            if (self.announceStrategy == 0) or (self.announceStrategy is None):
                 return True
             elif self.announceStrategy == 1:
-                if (time.time() - self.announceDict[packet.sender_id]) > (5 * 60):
-                    self.announceDict[packet.sender_id] = time.time()
+                if (time.time() - self.announceDict[packet.sender_id_str]) > (5 * 60):
+                    self.announceDict[packet.sender_id_str] = time.time()
                     return True
                 else:
                     return False
@@ -979,19 +982,20 @@ class BitchatClient:
                     )
                     await self.send_packet(key_exchange_packet)
             else:
-                # We have higher ID, send targeted identity announce to prompt them to initiate
-                debug_println(f"[CRYPTO] Sending targeted identity announce to {packet.sender_id_str} (tie-breaker: they have lower ID)")
+                # We have higher ID — Android PrivateChatManager still initiates
+                # from the higher side as well, so both sides try.  The
+                # SecurityManager resolves the resulting race.
+                debug_println(f"[CRYPTO] Also initiating Noise handshake with {packet.sender_id_str} (higher-ID side, matching Android behaviour)")
                 try:
+                    # Send targeted identity announce first so they know us
                     timestamp_ms = int(time.time() * 1000)
                     public_key_bytes = self.encryption_service.get_public_key()
                     signing_public_key_bytes = self.encryption_service.get_signing_public_key_bytes()
 
-                    # Create binding data for signature
                     timestamp_data = str(timestamp_ms).encode('utf-8')
                     binding_data = self.my_peer_id.encode('utf-8') + public_key_bytes + timestamp_data
                     signature = self.encryption_service.sign_data(binding_data)
 
-                    # Encode to binary format
                     identity_payload = self.encode_noise_identity_announcement_binary(
                         self.my_peer_id, public_key_bytes, signing_public_key_bytes,
                         self.nickname, timestamp_ms, signature
@@ -1003,8 +1007,21 @@ class BitchatClient:
                     )
                     identity_packet = sign_outgoing_packet(identity_packet, self.encryption_service)
                     await self.send_packet(identity_packet)
+
+                    await asyncio.sleep(0.3)
+
+                    # Now also initiate handshake (Android does this unconditionally)
+                    handshake_message = self.encryption_service.initiate_handshake(packet.sender_id_str)
+                    handshake_packet = create_bitchat_packet_with_recipient(
+                        self.my_peer_id, packet.sender_id_str, MessageType.NOISE_HANDSHAKE, handshake_message, None
+                    )
+                    handshake_data = bytearray(handshake_packet)
+                    handshake_data[2] = 7
+                    handshake_packet = bytes(handshake_data)
+                    await self.send_packet(handshake_packet)
+                    debug_println(f"[NOISE] Sent handshake init to {packet.sender_id_str} (higher-ID side)")
                 except Exception as e:
-                    debug_println(f"[CRYPTO] Failed to send targeted identity announce: {e}")
+                    debug_println(f"[CRYPTO] Failed to send targeted identity announce / handshake: {e}")
 
         # Relay ANNOUNCE if TTL > 1 (matching Android PacketRelayManager)
         await self._relay_packet(packet, raw_data, noRelay)
@@ -1234,6 +1251,14 @@ class BitchatClient:
         sender = packet.sender_id_str
         payload_size = len(packet.payload)
         is_init_message = payload_size == 32  # First message in XX pattern is just "e" (32 bytes)
+
+        # Android SecurityManager: if we already have an ESTABLISHED session and
+        # receive a new handshake init, drop the old session so we can re-establish
+        # cleanly.  This handles reconnections after one side restarted.
+        if is_init_message and self.encryption_service.is_session_established(sender):
+            debug_println(f"[NOISE] Received new handshake from {sender} with existing session — dropping old session to re-handshake (matching Android)")
+            self.encryption_service.remove_session(sender)
+
         if is_init_message and sender in self.encryption_service.handshake_states:
             existing_hs = self.encryption_service.handshake_states[sender]
             if existing_hs.role == NoiseRole.INITIATOR:
@@ -2915,7 +2940,10 @@ class BitchatClient:
                     self.my_peer_id, MessageType.ANNOUNCE, self.nickname.encode()
                 )
                 announce_packet = sign_outgoing_packet(announce_packet, self.encryption_service)
-                await self.send_packet(announce_packet,self.shouldSendOverLoRa(announce_packet)) #filter own announcements too
+                # Check announceStrategy: parse the encoded packet to a BitchatPacket for shouldSendOverLoRa
+                announce_parsed = parse_bitchat_packet(announce_packet)
+                should_lora = self.shouldSendOverLoRa(announce_parsed) if announce_parsed else True
+                await self.send_packet(announce_packet, via_lora=should_lora)
 
                 debug_println(f"[ANNOUNCE] Periodic re-announce sent")
             except Exception as e:
