@@ -3234,11 +3234,15 @@ class BitchatClient:
                 debug_println(f"[ERROR] Input error: {e}")
 
     async def fromLoraLoop(self):
+        nextSendTime = time.time() +20
         while self.running:
             try:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
+                        if time.time() > nextSendTime:
+                            await self.send_public_message("Ich bin ein Test-Text mit 100 Zeichen und freue mich gleich gesendet zu werden. Das macht echt Spaß.")
+                            nextSendTime = time.time() + random.randint(10,20)
                         package = self.fromLoRa.get_nowait()
                         #print(parse_bitchat_packet(package))
                     except queue.Empty:
