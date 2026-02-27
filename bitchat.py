@@ -2771,7 +2771,7 @@ class BitchatClient:
 
     async def send_public_message(self, content: str):
         """Send a public or channel message"""
-        if not self.client or not self.characteristic:
+        if (not self.client or not self.characteristic) and (self.toLoRa is None):
             print("\033[93m⚠ Not connected to any peers yet.\033[0m")
             print("\033[90mYour message will be sent once a connection is established.\033[0m")
             return
