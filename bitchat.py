@@ -28,6 +28,7 @@ from bitchatPython.terminal_ux import ChatContext, ChatMode, Public, Channel, Pr
 from bitchatPython.persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from bitchatPython.binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
 from bitchatPython.persistence import get_state_file_path
+from bitchatPython.geoPosition import getGeoPosition
 import threading
 
 # Version
@@ -200,6 +201,7 @@ class FragmentCollector:
 
 class BitchatClient:
     def __init__(self,fromLoRa = None,toLoRa = None):
+        self.POSITIONLOGFILE = "location_messages.log"
         self.fromLoRa = fromLoRa
         self.toLoRa = toLoRa
         self.nickname = "LoRa-Bridge"
@@ -223,6 +225,7 @@ class BitchatClient:
         self.announceStrategy = 0 #describes how often Announce messages are being sent or relayed over LoRa: 0 (default): all Announcements are being forwarded, 1: one Announcement per node every 5 minutes, 2: no Announcements at all (Signatures cant'b be validated in this mode, because the public keys are not available)
         self.announceDict = defaultdict(lambda : time.time() - 20 * 60) #only used if announceStrategy == 1, stores the last announce timestamp for each peer ID to determine if a new announce should be sent/relayed
         self.noPadding = False #if True, messages will be unpadded before transmission over LoRa. This makes traffic analysis easier but improves transmission speed.
+        self.lastGeoPositionTime = time.time() + 60 #don't start immediately
 
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
         self.encryption_service = EncryptionService(identity_path=_identity_path)
@@ -258,6 +261,10 @@ class BitchatClient:
         self.encryption_service.on_peer_authenticated = self._on_peer_authenticated
         self.encryption_service.on_handshake_required = self._on_handshake_required
         self.encryption_service.on_rekey_needed = self._on_rekey_needed
+
+        if not os.path.exists(self.POSITIONLOGFILE):
+            with open(self.POSITIONLOGFILE, "w") as f:
+                f.write("timestamp;position;\n")
 
     def _add_to_processed(self, message_id: str):
         """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
@@ -1292,6 +1299,11 @@ class BitchatClient:
         )
 
         print(f"\r\033[K{display}")
+
+        if display_content.startswith("POS:") and (sender_nick != self.nickname):
+            with open(self.POSITIONLOGFILE, "a") as f:
+                f.write(f"{time.time()};{display_content[4:]};\n")
+            await self.send_public_message("ACK: Location received!")
 
         if is_private and not isinstance(self.chat_context.current_mode, PrivateDM) and ((self.fromLoRa is None) and (self.toLoRa is None)):
             print("\033[90m» /r <message> to reply\033[0m")
@@ -2771,7 +2783,7 @@ class BitchatClient:
 
     async def send_public_message(self, content: str):
         """Send a public or channel message"""
-        if not self.client or not self.characteristic:
+        if (not self.client or not self.characteristic) and (self.toLoRa is not None):
             print("\033[93m⚠ Not connected to any peers yet.\033[0m")
             print("\033[90mYour message will be sent once a connection is established.\033[0m")
             return
@@ -3239,6 +3251,12 @@ class BitchatClient:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
+                        if self.lastGeoPositionTime + 30 < time.time():
+                            position = getGeoPosition()
+                            if position is not None:
+                                await self.send_public_message(f"POS:{position}")
+                            self.lastGeoPositionTime = time.time()
+
                         package = self.fromLoRa.get_nowait()
                         #print(parse_bitchat_packet(package))
                     except queue.Empty:
