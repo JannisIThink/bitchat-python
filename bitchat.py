@@ -30,6 +30,11 @@ from bitchatPython.binary_protocol import BinaryProtocol, BitchatPacket, Message
 from bitchatPython.persistence import get_state_file_path
 import threading
 
+#Role
+ROLE = 0 #0: half Duplex sender; 1: half Duplex receiver; 2: PingPongStart; 3: PingPongResponder
+DUMMYTEXT100CHARS = "Ich bin ein Test-Text mit 100 Zeichen und freue mich gleich gesendet zu werden. Das macht echt Spaß."
+LOGFILE = "bitchatSpeedLog.log"
+
 # Version
 VERSION = "v1.1.0"
 
@@ -258,6 +263,11 @@ class BitchatClient:
         self.encryption_service.on_peer_authenticated = self._on_peer_authenticated
         self.encryption_service.on_handshake_required = self._on_handshake_required
         self.encryption_service.on_rekey_needed = self._on_rekey_needed
+        self.timeLastPingPongStart = 0 #used for ROLE 2 PingPong to track when the last PingPongStart message was sent to determine when to send the next one
+
+        if not os.path.exists(LOGFILE):
+            with open(LOGFILE, "w") as f:
+                f.write("Timestamp;MessageID;\n")
 
     def _add_to_processed(self, message_id: str):
         """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
@@ -1292,6 +1302,19 @@ class BitchatClient:
         )
 
         print(f"\r\033[K{display}")
+
+        if (ROLE == 1) and (display_content == DUMMYTEXT100CHARS):
+            with open(LOGFILE, "a") as f:
+                f.write(f"{time.time()}; {message.id}\n")
+        elif (ROLE == 2) and (display_content.startswith("PONG:")):
+            with open(LOGFILE, "a") as f:
+                f.write(f"{time.time()}; {message.id}\n")
+            self.timeLastPingPongStart = time.time()
+            await self.send_public_message(f"PING: {DUMMYTEXT100CHARS}")
+        elif (ROLE == 3) and (display_content.startswith("PING:")):
+            with open(LOGFILE, "a") as f:
+                f.write(f"{time.time()}; {message.id}\n")
+            await self.send_public_message(f"PONG: {DUMMYTEXT100CHARS}")
 
         if is_private and not isinstance(self.chat_context.current_mode, PrivateDM) and ((self.fromLoRa is None) and (self.toLoRa is None)):
             print("\033[90m» /r <message> to reply\033[0m")
@@ -2771,7 +2794,7 @@ class BitchatClient:
 
     async def send_public_message(self, content: str):
         """Send a public or channel message"""
-        if not self.client or not self.characteristic:
+        if (not self.client or not self.characteristic) and (self.toLoRa is not None):
             print("\033[93m⚠ Not connected to any peers yet.\033[0m")
             print("\033[90mYour message will be sent once a connection is established.\033[0m")
             return
@@ -3239,6 +3262,13 @@ class BitchatClient:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
+                        if ROLE == 0: #half-duplex sender
+                            if self.toLoRa.qsize() < 10:
+                                await self.send_public_message(DUMMYTEXT100CHARS)
+                        elif (ROLE == 2) and ((time.time() - self.timeLastPingPongStart) > 10):
+                            self.timeLastPingPongStart = time.time()
+                            await self.send_public_message(f"PING:{DUMMYTEXT100CHARS}")
+
                         package = self.fromLoRa.get_nowait()
                         #print(parse_bitchat_packet(package))
                     except queue.Empty:
