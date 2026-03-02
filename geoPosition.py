@@ -11,7 +11,8 @@ class GPSModule:
 			self.ser = None
 			self.works = False
 
-	def tryGetPosition(self):
+	def tryGetPosition(self) -> str|None:
+		""" Versucht die aktuelle Position zu bestimmen und returnt None, wenn keien Position ermittelt werden konnte."""
 		if not self.works:
 			return None
 		for _ in range(30):
@@ -20,7 +21,6 @@ class GPSModule:
 				continue
 			else:
 				res = self.parse_gga(line)
-				print(res)
 				if res and (res["latitude"] != 0.0) and (res["longitude"] != 0.0) and (res["gps_qual"] != 0) and (res["num_sats"] >= 4):
 					return f"{res['latitude']};{res["longitude"]};{res["gps_qual"]};{res['num_sats']};{res["hdop"]}"
 		return None
@@ -49,7 +49,6 @@ class GPSModule:
     	}
 
 	def getGeoPosition(self) -> str|None:
-		#return None if no GPS module is avaliable.
 		return self.tryGetPosition()
 
 

@@ -265,7 +265,7 @@ class BitchatClient:
 
         if not os.path.exists(self.POSITIONLOGFILE):
             with open(self.POSITIONLOGFILE, "w") as f:
-                f.write("timestamp;position;\n")
+                f.write("timestamp;lat;long;quality;num_sats;hdop;\n")
 
     def _add_to_processed(self, message_id: str):
         """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
@@ -3255,7 +3255,7 @@ class BitchatClient:
                         if self.lastGeoPositionTime + 30 < time.time():
                             position = self.geoGetter.getGeoPosition()
                             if position is not None:
-                                await self.send_public_message(f"POS:{position}")
+                                await self.send_public_message(f"POS:{time.time()};{position}")
                             self.lastGeoPositionTime = time.time()
 
                         package = self.fromLoRa.get_nowait()
