@@ -4,15 +4,23 @@ import pynmea2
 
 class GPSModule:
 	def __init__(self):
-		self.ser = serial.Serial(port="/dev/ttyACM0",baudrate=9600,timeout=1)
+		self.works = True
+		try:
+			self.ser = serial.Serial(port="/dev/ttyACM0",baudrate=9600,timeout=1)
+		except Exception:
+			self.ser = None
+			self.works = False
 
 	def tryGetPosition(self):
+		if not self.works:
+			return None
 		for _ in range(30):
 			line = self.ser.readline().decode("ascii",errors="replace").strip()
 			if not line:
 				continue
 			else:
 				res = self.parse_gga(line)
+				print(res)
 				if res and (res["latitude"] != 0.0) and (res["longitude"] != 0.0) and (res["gps_qual"] != 0) and (res["num_sats"] >= 4):
 					return f"{res['latitude']};{res["longitude"]};{res["gps_qual"]};{res['num_sats']};{res["hdop"]}"
 		return None
