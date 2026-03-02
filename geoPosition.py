@@ -13,7 +13,9 @@ class GPSModule:
 				continue
 			else:
 				res = self.parse_gga(line)
-				print(res)
+				if res and (res["latitude"] != 0.0) and (res["longitude"] != 0.0) and (res["gps_qual"] != 0) and (res["num_sats"] >= 4):
+					return f"{res['latitude']};{res["longitude"]};{res["gps_qual"]};{res['num_sats']};{res["hdop"]}"
+		return None
 
 
 	def parse_gga(self, sentence: str) -> dict | None:
@@ -38,14 +40,12 @@ class GPSModule:
         "hdop": msg.horizontal_dil,
     	}
 
-
-
-def getGeoPosition(self) -> str|None:
-	#return None if no GPS module is avaliable.
-	return "DummyGeoPosition"
+	def getGeoPosition(self) -> str|None:
+		#return None if no GPS module is avaliable.
+		return self.tryGetPosition()
 
 
 
 
 if __name__ == "__main__":
-	print(getGeoPosition())
+	print(GPSModule().getGeoPosition())

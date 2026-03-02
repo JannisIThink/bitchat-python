@@ -28,7 +28,7 @@ from bitchatPython.terminal_ux import ChatContext, ChatMode, Public, Channel, Pr
 from bitchatPython.persistence import AppState, load_state, save_state, encrypt_password, decrypt_password
 from bitchatPython.binary_protocol import BinaryProtocol, BitchatPacket, MessageType, NoisePayloadType
 from bitchatPython.persistence import get_state_file_path
-from bitchatPython.geoPosition import getGeoPosition
+from bitchatPython.geoPosition import GPSModule
 import threading
 
 # Version
@@ -226,6 +226,7 @@ class BitchatClient:
         self.announceDict = defaultdict(lambda : time.time() - 20 * 60) #only used if announceStrategy == 1, stores the last announce timestamp for each peer ID to determine if a new announce should be sent/relayed
         self.noPadding = False #if True, messages will be unpadded before transmission over LoRa. This makes traffic analysis easier but improves transmission speed.
         self.lastGeoPositionTime = time.time() + 60 #don't start immediately
+        self.geoGetter = GPSModule()
 
         _identity_path = str(get_state_file_path().parent / "noise_identity.key")
         self.encryption_service = EncryptionService(identity_path=_identity_path)
@@ -3252,7 +3253,7 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     try:
                         if self.lastGeoPositionTime + 30 < time.time():
-                            position = getGeoPosition()
+                            position = self.geoGetter.getGeoPosition()
                             if position is not None:
                                 await self.send_public_message(f"POS:{position}")
                             self.lastGeoPositionTime = time.time()
