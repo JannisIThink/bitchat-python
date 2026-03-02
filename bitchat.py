@@ -3254,6 +3254,7 @@ class BitchatClient:
                     try:
                         if self.lastGeoPositionTime + 30 < time.time():
                             position = self.geoGetter.getGeoPosition()
+                            print(f"[GEO] Current position: {position}")
                             if position is not None:
                                 await self.send_public_message(f"POS:{time.time()};{position}")
                             self.lastGeoPositionTime = time.time()
