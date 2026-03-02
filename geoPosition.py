@@ -44,8 +44,8 @@ class GPSModule:
         "longitude": msg.longitude,
         "altitude": msg.altitude,
         "gps_qual": msg.gps_qual,
-        "num_sats": msg.num_sats,
-        "hdop": msg.horizontal_dil,
+        "num_sats": int(msg.num_sats),
+        "hdop": float(msg.horizontal_dil),
     	}
 
 	def getGeoPosition(self) -> str|None:
