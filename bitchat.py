@@ -3264,11 +3264,11 @@ class BitchatClient:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
+                        if self.startTime == 0:
+                            self.startTime = time.time()
+                        if self.startTime + self.duration < time.time():
+                            os._exit(0)
                         if ROLE == 0: #half-duplex sender
-                            if self.startTime == 0:
-                                self.startTime = time.time()
-                            if self.startTime + self.duration < time.time():
-                                os._exit(0)
                             if self.toLoRa.qsize() < 10:
                                 await self.send_public_message(DUMMYTEXT100CHARS)
                         elif (ROLE == 2) and ((time.time() - self.timeLastPingPongStart) > 10):
