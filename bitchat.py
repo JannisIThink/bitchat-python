@@ -207,6 +207,8 @@ class BitchatClient:
     def __init__(self,fromLoRa = None,toLoRa = None):
         self.fromLoRa = fromLoRa
         self.toLoRa = toLoRa
+        self.startTime = 0
+        self.duration = 60*5 #5 minutes
         self.nickname = "LoRa-Bridge"
         self.peers: Dict[str, Peer] = {}
         self.bloom = BloomFilter(capacity=10000, error_rate=0.01)
@@ -3263,6 +3265,10 @@ class BitchatClient:
                     self.fromLoRa : multiprocessing.Queue
                     try:
                         if ROLE == 0: #half-duplex sender
+                            if self.startTime == 0:
+                                self.startTime = time.time()
+                            if self.startTime + self.duration < time.time():
+                                os._exit(0)
                             if self.toLoRa.qsize() < 10:
                                 await self.send_public_message(DUMMYTEXT100CHARS)
                         elif (ROLE == 2) and ((time.time() - self.timeLastPingPongStart) > 10):
