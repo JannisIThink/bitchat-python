@@ -3271,7 +3271,7 @@ class BitchatClient:
                         if ROLE == 0: #half-duplex sender
                             if self.toLoRa.qsize() < 10:
                                 await self.send_public_message(DUMMYTEXT100CHARS)
-                        elif (ROLE == 2) and ((time.time() - self.timeLastPingPongStart) > 120):
+                        elif (ROLE == 2) and ((time.time() - self.timeLastPingPongStart) > 240):
                             self.timeLastPingPongStart = time.time()
                             await self.send_public_message(f"PING:{DUMMYTEXT100CHARS}")
 
