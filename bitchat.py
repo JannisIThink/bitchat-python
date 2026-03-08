@@ -3249,7 +3249,6 @@ class BitchatClient:
                 debug_println(f"[ERROR] Input error: {e}")
 
     async def fromLoraLoop(self):
-        count = 100
         while self.running:
             try:
                 if self.fromLoRa is not None:
@@ -3261,11 +3260,6 @@ class BitchatClient:
                                 print(f"[GEO] Failed to get position")
                             else:
                                 await self.send_public_message(f"POS:{position}")
-                                print("\n")
-                                count -= 1
-                            if count <= 0:
-                                print("[GEO] No more postitions")
-                                os._exit(0)
                             self.lastGeoPositionTime = time.time()
 
                         package = self.fromLoRa.get_nowait()
