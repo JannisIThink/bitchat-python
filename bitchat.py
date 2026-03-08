@@ -1299,7 +1299,7 @@ class BitchatClient:
             self.nickname
         )
 
-        print(f"\r\033[K{display}")
+        print(f"\r\033[K{display}\n")
 
         if display_content.startswith("POS:") and (sender_nick != self.nickname):
             with open(self.POSITIONLOGFILE, "a") as f:
@@ -3255,12 +3255,13 @@ class BitchatClient:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
-                        if self.lastGeoPositionTime + 8 < time.time():
+                        if self.lastGeoPositionTime + 45 < time.time():
                             position = self.geoGetter.getGeoPosition()
                             if position is None:
                                 print(f"[GEO] Failed to get position")
                             else:
                                 await self.send_public_message(f"POS:{position}")
+                                print("\n")
                                 count -= 1
                             if count <= 0:
                                 print("[GEO] No more postitions")
