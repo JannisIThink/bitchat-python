@@ -265,7 +265,7 @@ class BitchatClient:
 
         if not os.path.exists(self.POSITIONLOGFILE):
             with open(self.POSITIONLOGFILE, "w") as f:
-                f.write("timestamp;lat;long;quality;num_sats;hdop;\n")
+                f.write("timestamp;timestamp;lat;long;alt;quality;num_sats;hdop;\n")
 
     def _add_to_processed(self, message_id: str):
         """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
