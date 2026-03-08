@@ -265,7 +265,7 @@ class BitchatClient:
 
         if not os.path.exists(self.POSITIONLOGFILE):
             with open(self.POSITIONLOGFILE, "w") as f:
-                f.write("timestamp;timestamp;lat;long;alt;quality;num_sats;hdop;\n")
+                f.write("timestamp;lat;long;alt;quality;num_sats;hdop;\n")
 
     def _add_to_processed(self, message_id: str):
         """Add message ID to dedup dict with FIFO eviction at 10000 entries (matching Android)"""
@@ -1305,7 +1305,9 @@ class BitchatClient:
             with open(self.POSITIONLOGFILE, "a") as f:
                 f.write(f"{time.time()};{display_content[4:]};\n")
             await self.send_public_message("ACK: Location received!")
-
+        elif display_content.startswith("ACK:") and (sender_nick != self.nickname):
+            with open(self.POSITIONLOGFILE,"a") as f:
+                f.write(f"ACK received at {time.time()}\n")
         if is_private and not isinstance(self.chat_context.current_mode, PrivateDM) and ((self.fromLoRa is None) and (self.toLoRa is None)):
             print("\033[90m» /r <message> to reply\033[0m")
 
@@ -3247,16 +3249,22 @@ class BitchatClient:
                 debug_println(f"[ERROR] Input error: {e}")
 
     async def fromLoraLoop(self):
+        count = 100
         while self.running:
             try:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
-                        if self.lastGeoPositionTime + 30 < time.time():
+                        if self.lastGeoPositionTime + 8 < time.time():
                             position = self.geoGetter.getGeoPosition()
-                            print(f"[GEO] Current position: {position}")
-                            if position is not None:
-                                await self.send_public_message(f"POS:{time.time()};{position}")
+                            if position is None:
+                                print(f"[GEO] Failed to get position")
+                            else:
+                                await self.send_public_message(f"POS:{position}")
+                                count -= 1
+                            if count <= 0:
+                                print("[GEO] No more postitions")
+                                os._exit(0)
                             self.lastGeoPositionTime = time.time()
 
                         package = self.fromLoRa.get_nowait()
