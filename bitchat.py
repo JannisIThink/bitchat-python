@@ -1299,7 +1299,7 @@ class BitchatClient:
             self.nickname
         )
 
-        print(f"\r\033[K{display}\n")
+        print(f"\r\033[K{display}")
 
         if display_content.startswith("POS:") and (sender_nick != self.nickname):
             with open(self.POSITIONLOGFILE, "a") as f:
