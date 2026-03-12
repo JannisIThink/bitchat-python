@@ -3254,7 +3254,7 @@ class BitchatClient:
                 if self.fromLoRa is not None:
                     self.fromLoRa : multiprocessing.Queue
                     try:
-                        if self.lastGeoPositionTime + 45 < time.time():
+                        if self.lastGeoPositionTime + 20 < time.time():
                             position = self.geoGetter.getGeoPosition()
                             if position is None:
                                 print(f"[GEO] Failed to get position")
