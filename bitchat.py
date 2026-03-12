@@ -208,7 +208,7 @@ class BitchatClient:
         self.fromLoRa = fromLoRa
         self.toLoRa = toLoRa
         self.startTime = 0
-        self.duration = 60*5 #5 minutes
+        self.duration = 60*60 #60 minutes
         self.nickname = "LoRa-Bridge"
         self.peers: Dict[str, Peer] = {}
         self.bloom = BloomFilter(capacity=10000, error_rate=0.01)
