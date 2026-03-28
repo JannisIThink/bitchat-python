@@ -2998,8 +2998,6 @@ class BitchatClient:
             await asyncio.sleep(30)
             if not self.running:
                 break
-            if self.disable_bluetooth_transmission:
-                continue
             # Allow announcements even without BLE when LoRa is available,
             # so that LoRa-only peers can discover this node.
             has_ble = self.client and self.client.is_connected
