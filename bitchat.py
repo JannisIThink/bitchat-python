@@ -220,7 +220,7 @@ class BitchatClient:
         # When True, all processing happens normally but actual BT send/receive is skipped
         self.disable_bluetooth_transmission: bool = False
         # Persist Noise identity in the same directory as app state (~/.bitchatxxk/)
-        self.announceStrategy = 0 #describes how often Announce messages are being sent or relayed over LoRa: 0 (default): all Announcements are being forwarded, 1: one Announcement per node every 5 minutes, 2: no Announcements at all (Signatures cant'b be validated in this mode, because the public keys are not available)
+        self.announceStrategy = 0 #describes how often Announce messages are being sent or relayed over LoRa: 0 (default): all Announcements are being forwarded, 1: one Announcement per node every 5 minutes
         self.announceDict = defaultdict(lambda : time.time() - 20 * 60) #only used if announceStrategy == 1, stores the last announce timestamp for each peer ID to determine if a new announce should be sent/relayed
         self.noPadding = False #if True, messages will be unpadded before transmission over LoRa. This makes traffic analysis easier but improves transmission speed.
 
@@ -970,8 +970,6 @@ class BitchatClient:
                     return True
                 else:
                     return False
-            elif self.announceStrategy == 2:
-                return False
             else:
                 raise Exception(f"Announce Strategy {self.announceStrategy} is currently not implemented!")
         else:
@@ -2998,8 +2996,6 @@ class BitchatClient:
             await asyncio.sleep(30)
             if not self.running:
                 break
-            if self.disable_bluetooth_transmission:
-                continue
             # Allow announcements even without BLE when LoRa is available,
             # so that LoRa-only peers can discover this node.
             has_ble = self.client and self.client.is_connected
